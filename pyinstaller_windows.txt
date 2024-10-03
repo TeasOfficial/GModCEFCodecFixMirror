@@ -1,0 +1,1 @@
+pyinstaller --upx-dir "./UPX" --onedir GModCEFCodecFix.py --icon=GModPatchToolLogo.png --clean

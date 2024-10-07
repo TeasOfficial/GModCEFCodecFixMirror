@@ -66,12 +66,3 @@ jobs:
           asset_path: ./dist/GModCEFCodecFix${{ runner.os == 'Windows' && '.exe' || '' }}
           asset_name: GModCEFCodecFix-${{ runner.os }}${{ runner.os == 'Windows' && '.exe' || '' }}
           asset_content_type: application/octet-stream
-
-      - name: 推送到Webdav
-        uses: bxb100/action-upload-webdav@v1
-        with:
-          webdav_address: ${{secrets.ADDRESS}}
-          webdav_username: ${{secrets.USERNAME}}
-          webdav_password: ${{secrets.PASSWORD}}
-          webdav_upload_path: /GModCEFCodecFix/dist/${{ runner.os }}
-          files: ./dist/GModCEFCodecFix${{ runner.os == 'Windows' && '.exe' || '' }}

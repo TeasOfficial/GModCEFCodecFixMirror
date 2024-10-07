@@ -15,7 +15,7 @@ DEBUGMODE = False
 
 # Chinese Fix: OriginalSnow
 
-VERSION = 20241003
+VERSION = 20241007
 
 import sys
 import os
@@ -58,7 +58,8 @@ possibleTerminals = [
 	"alacritty",
 	"hyper",
 	"foot",
-	"kgx"
+	"kgx",
+	"cosmic-term"
 ]
 termNotFoundError = "GModCEFCodecFix 未发现合适的终端程序！\n\t如果你确定已经安装了终端程序，请联系原作者：\n- Discord: https://www.solsticegamestudios.com/chat.html\n- Email: contact@solsticegamestudios.com"
 
@@ -131,7 +132,7 @@ if systemProxies:
 	print("System Proxies:\n" + str(systemProxies) + "\n")
 
 try:
-	versionOnline = httpx.get("https://vr.nekogan.com/d/GModCEFCodecFix/version.txt", follow_redirects=True, timeout=60)
+	versionOnline = httpx.get("https://pan.nekogan.com/main/version.txt", follow_redirects=True, timeout=60)
 	if versionOnline.status_code == 200:
 		remoteVersion = int(versionOnline.text)
 		secsToContinue = 3
@@ -154,7 +155,7 @@ except Exception as e:
 if sslVerify:
 	versionOnline.close()
 
-dlServers = httpx.get("https://vr.nekogan.com/d/GModCEFCodecFix/mirrors.json", follow_redirects=True, timeout=60).json()
+dlServers = httpx.get("https://pan.nekogan.com/main/mirrors.json", follow_redirects=True, timeout=60).json()
 
 print(colored("[镜像版] 请选择更新服务器（注：1Mbps = 128KB/s）：\n", "light_blue"))
 serverid = 1
@@ -193,7 +194,6 @@ from hashlib import sha256
 from concurrent.futures import ThreadPoolExecutor
 from bsdiff4 import file_patch
 from pathlib import Path
-from rich.progress import Progress, BarColumn, DownloadColumn, TransferSpeedColumn
 from tempfile import gettempdir
 
 import urllib3
@@ -567,9 +567,6 @@ if not gmodBranch in manifest[sysPlatformProtonMasked]:
 manifest = manifest[sysPlatformProtonMasked][gmodBranch]
 print("CEFCodecFix Manifest 监测成功!\n正在检索文件列表...")
 
-if DEBUGMODE:
-	sys.exit("DEBUG OVER, PROGRAM EXITING...")
-
 def getFileSHA256(filePath):
 	fileSHA256 = sha256()
 
@@ -604,18 +601,18 @@ def determineFileIntegrityStatus(file):
 			if fileSHA256OrException == manifest[file]["original"]:
 				# And it matches the original
 				filesToUpdate.append(file)
-				return True, "\t" + file + ": SHA256通过，等待下载"
+				return True, "\t" + file + ": 需要修补"
 			elif manifest[file]["original"] == blankFileSHA256:
 				# And it was empty originally, so we're gonna wipe it first
 				filesToWipe.append(file)
 				filesToUpdate.append(file)
-				return True, "\t" + file + ": SHA256校验通过"
+				return True, "\t" + file + ": 需要擦除"
 			else:
 				# And it doesn't match the original...
 				#fileNoMatchOriginal = True
-				return True, "\t" + file + ": SHA256校验错误"
+				return True, "\t" + file + ": 文件不匹配！"
 		else:
-			return True, "\t" + file + ": 检测通过"
+			return True, "\t" + file + ": 文件正常"
 	else:
 		return False, "\t" + file + ": " + fileSHA256OrException
 
@@ -670,35 +667,19 @@ if len(filesToUpdate) > 0:
 				cachedFileValid = True
 
 		if not cachedFileValid:
-			patchURL = manifest[file]["patch-url"].replace("https://media.githubusercontent.com/media/solsticegamestudios/GModPatchTool/master/", downloadServer)
-			patchURL = patchURL.replace("https://media.githubusercontent.com/media/solsticegamestudios/GModCEFCodecFix/master/", downloadServer)
-			patchURL = patchURL.replace("https://gmod.zifengtang.com/GModPatchTool/master/", "https://gmod.zifengtang.com/GModCEFCodecFix/master/")
+			patchURL = manifest[file]["patch-url"].replace("https://media.githubusercontent.com/media/solsticegamestudios/GModCEFCodecFix/master/", downloadServer)
+			print("\t下载 > " + patchURL + "...")
+			patchURLRequest = httpx.get(patchURL, follow_redirects=True, timeout=None)
 
-			try:
-				print("下载 > " + patchURL)
-
-				with httpx.stream("GET", patchURL, timeout=None) as response:
-					total = int(response.headers["Content-Length"])
-
-					with Progress(
-						"[progress.percentage]{task.percentage:>3.0f}%",
-						BarColumn(bar_width=None),
-						DownloadColumn(),
-						TransferSpeedColumn(),
-					) as progress:
-						download_task = progress.add_task("Download", total=total)
-						os.makedirs(os.path.dirname(patchFilePath), exist_ok = True)
-						
-						with open(patchFilePath, "wb") as newCEFPatch:
-							for chunk in response.iter_bytes():
-								newCEFPatch.write(chunk)
-								progress.update(download_task, completed=response.num_bytes_downloaded)
-
-			except Exception as e:
-				sys.exit(f"下载失败：{e}")
+			if patchURLRequest.status_code != 200:
+				sys.exit(colored(f"下载 {file} 时失败 | HTTP {str(patchURLRequest.status_code)} \n" + contactInfo, "red"))
+			else:
+				os.makedirs(os.path.dirname(patchFilePath), exist_ok = True)
+				with open(patchFilePath, "wb") as newCEFPatch:
+					newCEFPatch.write(patchURLRequest.content)
 
 	for file in filesToUpdate:
-		print("\t校验文件 > " + file + "...")
+		print("\t修补中 > " + file + "...")
 
 		originalFilePath = os.path.join(gmodPath, file)
 		patchFilePath = os.path.normcase(os.path.realpath(os.path.join(cacheDir, file + ".bsdiff")))

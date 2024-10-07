@@ -9,4 +9,3 @@ bsdiff4
 psutil; sys_platform == 'linux'
 xdg; sys_platform == 'linux'
 pillow; sys_platform == 'win32'
-rich

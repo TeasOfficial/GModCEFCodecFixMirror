@@ -1,6 +1,6 @@
 # GModCEFCodecFix 镜像版
 
-![GModCEFCodecFix](./assets/GModCEFCodecFixIcon.png)
+![GModCEFCodecFix](./GModCEFCodecFixIcon.png)
 
 一个自动化程序，用于自动将 [Garry's Mod](https://gmod.facepunch.com/) 的内置 [Chromium Embedded Framework](https://en.wikipedia.org/wiki/Chromium_Embedded_Framework) 提供以下功能的支持:
 - 将 CEF 升级到最新版

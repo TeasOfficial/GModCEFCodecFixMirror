@@ -59,7 +59,8 @@ possibleTerminals = [
 	"hyper",
 	"foot",
 	"kgx",
-	"cosmic-term"
+	"cosmic-term",
+	"ptyxis"
 ]
 termNotFoundError = "GModCEFCodecFix 未发现合适的终端程序！\n\t如果你确定已经安装了终端程序，请联系原作者：\n- Discord: https://www.solsticegamestudios.com/chat.html\n- Email: contact@solsticegamestudios.com"
 

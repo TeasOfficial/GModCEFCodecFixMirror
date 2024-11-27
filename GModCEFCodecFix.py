@@ -15,7 +15,7 @@ DEBUGMODE = False
 
 # Chinese Fix: OriginalSnow
 
-VERSION = 20241007
+VERSION = 20241127
 
 import sys
 import os

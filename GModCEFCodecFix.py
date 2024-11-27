@@ -719,7 +719,7 @@ if len(filesToUpdate) > 0:
 			print(colored("\t异常 > " + str(e), "yellow"))
 			sys.exit(colored(gmodFileFailed, "red"))
 else:
-	print("\n"+httpx.get("https://tenapi.cn/v2/yiyan").text)
+	print("\nAPI服务商跑路了！！！怒！！！")
 
 print(colored("\nCEFCodecFix 成功启动! 启动时间: " + str(round(perf_counter() - timeStart, 4)) + " 秒.", "green"))
 

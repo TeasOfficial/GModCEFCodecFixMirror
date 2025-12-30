@@ -1,1 +1,0 @@
-pyinstaller -F GModCEFCodecFix.py --icon=GModPatchToolLogo.png --clean

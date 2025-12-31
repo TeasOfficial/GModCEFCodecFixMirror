@@ -15,15 +15,20 @@ const ABOUT: &str = r#"   ________  ___          ______        __       __  ____
  / / __/ /|_/ / __ \/ __  / /_/ / __ `/ __/ ___/ __ \/ / / __ \/ __ \/ /
 / /_/ / /  / / /_/ / /_/ / ____/ /_/ / /_/ /__/ / / / / / /_/ / /_/ / /
 \____/_/  /_/\____/\__,_/_/    \__,_/\__/\___/_/ /_/_/  \____/\____/_/
-GModPatchTool (曾经是 GModCEFCodecFix)
 
 版权所有 2020-2025, Solstice Game Studios (solsticegamestudios.com)
 开源协议 GNU General Public License v3.0
 
-使用教程 https://solsticegamestudios.com/fixmedia/
-疑难解答 https://solsticegamestudios.com/fixmedia/faq/
-联系方式 https://solsticegamestudios.com/discord/
-电子邮箱 contact@solsticegamestudios.com
+修复：初雪 OriginalSnow
+
+
+国内发行版联系方式：
+	> 交流群：105969906
+	> 邮箱：admin@nekogan.com
+论坛：https://bbs.ipairsdo.xin
+
+友情链接：
+	> 申必の果茶店（QQ群）：920655299
 "#;
 
 use std::path::{Path, PathBuf};

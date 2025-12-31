@@ -1,11 +1,11 @@
 // Version and Manifest files
 const TEXT_SERVER_ROOTS: [&str; 1] = [
-	"https://solsticegamestudios.com/gmodpatchtool/"
+	"http://g.pan.nekogan.com/GModPatchTool/"
 ];
 
 // Patch files
 const BINARY_SERVER_ROOTS: [&str; 1] = [
-	"https://solsticegamestudios.com/gmodpatchtool/" // TODO: Webhook that triggers git pull and clears the cache on Cloudflare
+	"http://g.pan.nekogan.com/GModPatchTool/"
 ];
 
 //const GMOD_STEAM_APPID: u64 = 4000;
@@ -91,9 +91,9 @@ phf_map! {
 use thiserror::Error;
 #[derive(Debug, Error)]
 enum AlmightyError {
-	#[error("HTTP Error: {0}")]
+	#[error("HTTP 错误: {0}")]
 	Http(#[from] reqwest::Error),
-	#[error("Remote Version parsing error: {0}")]
+	#[error("远程版本号解析出错: {0}")]
 	Parse(#[from] std::num::ParseIntError),
 	#[error("{0}")]
 	Generic(String)
@@ -551,7 +551,7 @@ where
 
 		if let Ok(file_hash) = file_hash_result {
 			if file_hash == target_hash {
-				terminal_write(writer, format!("\t已通过缓存加载: {filename}").as_str(), true, None);
+				terminal_write(writer, format!("\t已通过缓存加载: {filename}").as_str(), true, Some("green"));
 				return Ok(());
 			}
 		}
@@ -585,7 +585,7 @@ where
 				return Err(());
 			}
 
-			terminal_write(writer, format!("\t已解压: {filename}").as_str(), true, None);
+			terminal_write(writer, format!("\t已解压: {filename}").as_str(), true, Some("green"));
 		}
 
 		let write_result = tokio::fs::write(cache_file_path.clone(), bytes).await;
@@ -599,7 +599,7 @@ where
 			Ok(file_hash) => {
 				if file_hash == target_hash {
 					let size_mib = response_bytes.len() as f64 / 0x100000 as f64;
-					terminal_write(writer, format!("\t已下载 [{size_mib:.2} MiB]: {filename}").as_str(), true, None);
+					terminal_write(writer, format!("\t已下载 [{size_mib:.2} MiB]: {filename}").as_str(), true, Some("green"));
 					return Ok(());
 				} else {
 					terminal_write(writer, format!("\t下载失败: {filename} | 步骤 4: 校验未通过，可能是文件损坏").as_str(), true, if writer_is_interactive { Some("red") } else { None });
@@ -821,7 +821,7 @@ where
 	let local_version: u32 = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap();
 
 	// Get remote version
-	terminal_write(writer, "正在获取最新版本信息...", true, None);
+	terminal_write(writer, "正在获取最新版本信息...\n", true, None);
 
 	let remote_version = get_http_response_text(writer, writer_is_interactive, &TEXT_SERVER_ROOTS, "version.txt").await;
 
@@ -837,20 +837,20 @@ where
 	if local_version >= remote_version {
 		terminal_write(writer, format!("🎉恭喜，你正在运行最新版的 GModPatchTool\n[当前版本: {local_version} / 最新版本: {remote_version}]!\n").as_str(), true, if writer_is_interactive { Some("green") } else { None });
 	} else {
-		terminal_write(writer, "⚠️警告: GModPatchTool 有新版本啦！我们推荐你下载最新版本以获取到更多新内容！\nhttps://github.com/solsticegamestudios/GModPatchTool/releases", true, if writer_is_interactive { Some("red") } else { None });
+		terminal_write(writer, "⚠️警告: GModPatchTool 有新版本啦！我们推荐你下载最新版本以获取到更多新内容！\nhttps://juice.catkim.xyz/index.php/gmodcefcodecfix/", true, if writer_is_interactive { Some("red") } else { None });
+	}
 
-		let mut secs_to_continue: u8 = 5;
-		while secs_to_continue > 0 {
-			terminal_write(writer, format!("\t将在 {secs_to_continue} 秒后继续...\r").as_str(), false, if writer_is_interactive { Some("yellow") } else { None });
-			writer().flush().unwrap();
-			tokio::time::sleep(time::Duration::from_secs(1)).await;
-			secs_to_continue -= 1;
-		}
+	let mut secs_to_continue: u8 = 5;
+	while secs_to_continue > 0 {
+		terminal_write(writer, format!("\t将在 {secs_to_continue} 秒后继续...\r").as_str(), false, if writer_is_interactive { Some("yellow") } else { None });
+		writer().flush().unwrap();
+		tokio::time::sleep(time::Duration::from_secs(1)).await;
+		secs_to_continue -= 1;
+	}
 
-		// Clear continuing line
-		if writer_is_interactive {
-			terminal_write(writer, "\x1B[0K\n", false, None);
-		}
+	// Clear continuing line
+	if writer_is_interactive {
+		terminal_write(writer, "\x1B[0K\n", false, None);
 	}
 
 	// Warn/Exit if running as root/admin
@@ -1345,8 +1345,21 @@ where
 	let integrity_results: Vec<(&String, Result<IntegrityStatus, String>, &IndexMap<String, String>)> = platform_branch_files.par_iter()
 	.map(|(filename, hashes)| {
 		let integrity_result;
+		let mut sourcescheme_select = String::new();
+
+		// if sourcescheme_select != "" && !args.no_sourcescheme && filename.ends_with(".res") {
+		// 	terminal_write(writer,"⚠️警告：最新版的 GModPatchTool 会修改 GMod 的 VGUI 组件，并且会修改控制台的文本样式，如果你不喜欢可以禁用该功能！", true, Some("red"));
+		// 	terminal_write(writer,"是否要安装 SourceScheme？(y/n) ", true, None);
+		// 	io::stdin()
+		// 		.read_line(&mut sourcescheme_select)
+		// 		.expect("您的输入有误！");
+		// }
+
 		if args.no_sourcescheme && filename.ends_with(".res") {
-			terminal_write(writer, format!("\t{filename}: 因 --no-sourcescheme 而被跳过").as_str(), true, if writer_is_interactive { Some("yellow") } else { None });
+			terminal_write(writer, format!("\t{filename}: 因 --no-sourcescheme 而被跳过").as_str(), true, if writer_is_interactive { Some("green") } else { None });
+			integrity_result = Ok(IntegrityStatus::Fixed);
+		} else if sourcescheme_select == "y" && filename.ends_with(".res") {
+			terminal_write(writer, format!("\t{filename}: 因 用户选择 而被跳过").as_str(), true, if writer_is_interactive { Some("green") } else { None });
 			integrity_result = Ok(IntegrityStatus::Fixed);
 		} else {
 			integrity_result = determine_file_integrity_status(gmod_path.clone(), filename, hashes);
@@ -1355,7 +1368,7 @@ where
 			match integrity_result_clone {
 				Ok(integrity_result_clone) => {
 					let integrity_status_string = integrity_status_strings[&integrity_result_clone];
-					terminal_write(writer, format!("\t{filename}: {integrity_status_string}").as_str(), true, None);
+					terminal_write(writer, format!("\t{filename}: {integrity_status_string}").as_str(), true, if integrity_result_clone == IntegrityStatus::Fixed { Some("green") } else { None });
 				},
 				Err(error) => {
 					terminal_write(writer, format!("\t{filename}: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
@@ -1508,7 +1521,7 @@ where
 			}
 		}
 	} else {
-		terminal_write(writer, "天气真好~", true, None);
+		terminal_write(writer, "\n没有文件需要修补，天气真好~", true, Some("green"));
 	}
 
 	// Make sure executables are executable on Linux and macOS
@@ -1600,7 +1613,8 @@ where
 	}
 
 	terminal_write(writer, "\n💖 你是否认为该工具很好用？请在下面的链接支持我们！", true, if writer_is_interactive { Some("magenta") } else { None });
-	terminal_write(writer, "\thttps://solsticegamestudios.com/donate/", true, None);
+	terminal_write(writer, "\t服务器提供商 > https://afdian.com/a/13467kk", true, None);
+	terminal_write(writer, "\t软件原作者 > https://solsticegamestudios.com/donate/", true, None);
 
 	Ok(())
 }

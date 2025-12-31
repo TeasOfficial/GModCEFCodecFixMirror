@@ -71,3 +71,7 @@ resources = ["GModPatchToolLogo.icns"]
 icons = ["GModPatchToolLogo.icns"]
 macos = { minimum-system-version = "11.0" }
 #dmg = { background = "macos-background.png", window-size = "640 360", app-position = "", app-folder-position = "" }
+
+[profile.release]
+strip = true
+lto = true

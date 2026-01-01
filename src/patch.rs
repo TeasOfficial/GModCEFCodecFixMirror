@@ -1,11 +1,13 @@
 // Version and Manifest files
-const TEXT_SERVER_ROOTS: [&str; 1] = [
-	"http://g.pan.nekogan.com/GModPatchTool/"
+const TEXT_SERVER_ROOTS: [&str; 2] = [
+	"http://g.pan.nekogan.com/GModPatchTool/",
+	"http://pan.nekogan.com/GPT/"
 ];
 
 // Patch files
-const BINARY_SERVER_ROOTS: [&str; 1] = [
-	"http://g.pan.nekogan.com/GModPatchTool/"
+const BINARY_SERVER_ROOTS: [&str; 2] = [
+	"http://g.pan.nekogan.com/GModPatchTool/",
+	"http://pan.nekogan.com/GPT/"
 ];
 
 //const GMOD_STEAM_APPID: u64 = 4000;
@@ -349,7 +351,7 @@ where
 					response = Some(response_unwrapped);
 					break;
 				} else {
-					terminal_write(writer, format!("\n{url}\n\t错误的 HTTP 状态码: {response_status_code}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+					terminal_write(writer, format!("\n{url}\n\t错误的 HTTP 状态码: {response_status_code}\n\n正在尝试切换下载源...").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 					response = None;
 					server_id += 1;
 					try_count = 0;
@@ -357,7 +359,7 @@ where
 			},
 			Err(error) => {
 				let error = error.without_url();
-				terminal_write(writer, format!("\n{url}\n\tHTTP 出错: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\n{url}\n\tHTTP 出错: {error}\n\n当前重试次数：{try_count}。\n你无需担心，失败三次后会更换 CDN 备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 				response = None;
 				try_count += 1;
 
@@ -397,7 +399,7 @@ where
 					break;
 				},
 				Err(error) => {
-					terminal_write(writer, format!("\nHTTP 字节错误: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+					terminal_write(writer, format!("\nHTTP 字节错误: {error}\n\n当前重试次数：{try_count}。\n你无需担心，失败三次后会更换 CDN 备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 					response_bytes = None;
 					try_count += 1;
 
@@ -435,7 +437,7 @@ where
 					break;
 				},
 				Err(error) => {
-					terminal_write(writer, format!("\nHTTP 文本错误: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+					terminal_write(writer, format!("\nHTTP 文本错误: {error}\n\n当前重试次数：{try_count}。\n你无需担心，失败三次后会更换 CDN 备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 					response_text = None;
 					try_count += 1;
 
@@ -474,7 +476,7 @@ where
 					break;
 				},
 				Err(error) => {
-					terminal_write(writer, format!("\nHTTP JSON 错误: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+					terminal_write(writer, format!("\nHTTP JSON 错误: {error}\n\n当前重试次数：{try_count}。\n你无需担心，失败三次后会更换 CDN 备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 					response_json = None;
 					try_count += 1;
 
@@ -878,7 +880,7 @@ where
 				terminal_write(writer, "\x1B[0K\n", false, None);
 			}
 		} else {
-			let elevated_msg = format!("你当前正以管理员身份运行 GModPatchTool{}，这是没有必要的，而且会导致一些不该出现的问题！\n\n如果你知道你在做什么，你可以通过添加启动项 --run-as-root-with-security-risk 来继续运行该程序，程序即将退出...", if cfg!(windows) { " (UAC是否已经关闭?)" } else { "" });
+			let elevated_msg = format!("你当前正以管理员身份运行 GModPatchTool{}，这是没有必要的，而且会导致一些不该出现的问题！\n\n如果你知道你在做什么，你可以通过添加启动项 --run-as-root-with-security-risk 来继续运行该程序，程序即将退出...", if cfg!(windows) { "\n (如果你坚信你没有使用管理员权限运行，那么UAC账户控制很可能已被关闭！)" } else { "" });
 			return Err(AlmightyError::Generic(elevated_msg));
 		}
 	}
@@ -909,6 +911,8 @@ where
 			terminal_write(writer, "\x1B[0K\n", false, None);
 		}
 	}
+
+	// TODO: 选择服务器
 
 	// Find Steam
 	let mut steam_path = None;

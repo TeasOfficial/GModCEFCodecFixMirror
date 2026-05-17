@@ -1,11 +1,11 @@
 // Version and Manifest files
 const TEXT_SERVER_ROOTS: [&str; 1] = [
-	"https://mf.nekogan.com/raw/"
+	"https://scs.mf.nekogan.com/raw/"
 ];
 
 // Patch files
 const BINARY_SERVER_ROOTS: [&str; 1] = [
-	"https://mf.nekogan.com/media/"
+	"https://scs.mf.nekogan.com/media/"
 ];
 
 //const GMOD_STEAM_APPID: u64 = 4000;

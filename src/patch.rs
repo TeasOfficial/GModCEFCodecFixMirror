@@ -1615,8 +1615,10 @@ where
 	}
 
 	terminal_write(writer, "\n💖 你是否认为该工具很好用？请在下面的链接支持我们！", true, if writer_is_interactive { Some("magenta") } else { None });
-	terminal_write(writer, "\t服务器提供商 > https://afdian.com/a/13467kk", true, None);
 	terminal_write(writer, "\t软件原作者 > https://solsticegamestudios.com/donate/", true, None);
+	terminal_write(writer, "\n\n软件的运营需要成本，如果你有能力的话请帮帮我们！", true, if writer_is_interactive { Some("magenta") } else { None });
+	terminal_write(writer, "\t赞助链接 > https://blog.nekogan.com/1779011106565", true, None);
+	terminal_write(writer, "\n求求啦，谢谢啦 🙏🙏🙏", true, None);
 
 	Ok(())
 }

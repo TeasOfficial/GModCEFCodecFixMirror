@@ -1,11 +1,11 @@
 // Version and Manifest files
 const TEXT_SERVER_ROOTS: [&str; 1] = [
-	"https://mf.nekogan.com/gmodpatchtool"
+	"https://mf.nekogan.com/gmodpatchtool/"
 ];
 
 // Patch files
 const BINARY_SERVER_ROOTS: [&str; 1] = [
-	"https://mf.nekogan.com/gmodpatchtool"
+	"https://mf.nekogan.com/gmodpatchtool/"
 ];
 
 //const GMOD_STEAM_APPID: u64 = 4000;

@@ -1,5 +1,7 @@
 # GModPatchTool 镜像版 <sub>_曾是 GModCEFCodecFix_</sub>
 
+最新版下载：https://nekogan.com/gccf
+
 ![GModPatchTool](GModPatchToolLogo.png)
 
 **由 Solstice Game Studios 制作 (solsticegamestudios.com)**

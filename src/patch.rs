@@ -1,13 +1,19 @@
-// Version and Manifest files
-const TEXT_SERVER_ROOTS: [&str; 1] = [
-	"https://scs.mf.nekogan.com/raw/"
-];
+// 镜像源服务器根地址
+// gh-proxy.com（Cloudflare v4 优选加速节点，仅走 IPv4 智能解析）
+const GH_PROXY_HOST: &str = "v4.gh-proxy.org";
+const GH_PROXY_TEXT_ROOT: &str = "https://v4.gh-proxy.org/https://raw.githubusercontent.com/solsticegamestudios/GModPatchTool/refs/heads/files/";
+const GH_PROXY_BINARY_ROOT: &str = "https://v4.gh-proxy.org/https://github.com/solsticegamestudios/GModPatchTool/raw/refs/heads/files/";
 
+// scs.mf.nekogan.com（镜像站备用源）
+const NEKOGAN_TEXT_ROOT: &str = "https://scs.mf.nekogan.com/raw/";
+const NEKOGAN_BINARY_ROOT: &str = "https://scs.mf.nekogan.com/media/";
 
-// Patch files
-const BINARY_SERVER_ROOTS: [&str; 1] = [
-	"https://scs.mf.nekogan.com/media/"
-];
+// 启动测速：用一个小补丁文件检测二进制源是否真的可用，并测量下载速度
+const SPEED_TEST_TEXT_FILE: &str = "manifest.json";
+const SPEED_TEST_BINARY_FILE: &str = "patches/windows/dev/bin/chrome_100_percent.pak.bsdiff";
+const SPEED_TEST_MAX_BYTES: usize = 2 * 1024 * 1024; // 每个源最多测 2 MiB
+const GOOD_SPEED_BYTES_PER_SEC: u64 = 1024 * 1024; // 达到 1 MiB/s 视为速度理想
+const SPEED_TEST_TIMEOUT: time::Duration = time::Duration::from_secs(8);
 
 
 //const GMOD_STEAM_APPID: u64 = 4000;
@@ -36,6 +42,7 @@ use steamid::SteamId;
 use sysinfo::System;
 use std::fs::File;
 use std::io;
+use std::net::SocketAddr;
 use bytes::Bytes;
 use reqwest::Response;
 use tokio::time::Instant;
@@ -368,6 +375,198 @@ where
 	}
 }
 
+/// 启动时选出的 gh-proxy IPv4 优选节点；选好后所有请求都固定走这个 IP
+static GH_PROXY_IPV4_NODE: OnceLock<SocketAddr> = OnceLock::new();
+
+// 测速后可能的镜像源组合（按速度从快到慢排列）
+static GH_PROXY_FIRST_TEXT_ROOTS: [&str; 2] = [GH_PROXY_TEXT_ROOT, NEKOGAN_TEXT_ROOT];
+static NEKOGAN_FIRST_TEXT_ROOTS: [&str; 2] = [NEKOGAN_TEXT_ROOT, GH_PROXY_TEXT_ROOT];
+static NEKOGAN_ONLY_TEXT_ROOTS: [&str; 1] = [NEKOGAN_TEXT_ROOT];
+static GH_PROXY_FIRST_BINARY_ROOTS: [&str; 2] = [GH_PROXY_BINARY_ROOT, NEKOGAN_BINARY_ROOT];
+static NEKOGAN_ONLY_BINARY_ROOTS: [&str; 1] = [NEKOGAN_BINARY_ROOT];
+
+struct MirrorSelection {
+	text_roots: &'static [&'static str],
+	binary_roots: &'static [&'static str]
+}
+
+/// 解析域名下的全部 IPv4 地址（gh-proxy v4 优选节点仅使用 IPv4）
+async fn resolve_ipv4_nodes(host: &str) -> Vec<SocketAddr> {
+	match tokio::net::lookup_host((host, 443)).await {
+		Ok(addresses) => addresses.filter(|address| address.is_ipv4()).collect(),
+		Err(_) => Vec::new()
+	}
+}
+
+/// 构建 HTTP 客户端；若已选出 gh-proxy IPv4 优选节点，则固定解析到该节点
+fn http_client_builder(no_system_proxy: bool) -> reqwest::ClientBuilder {
+	let mut builder = reqwest::Client::builder();
+
+	if no_system_proxy {
+		builder = builder.no_proxy();
+	}
+
+	if let Some(ipv4_node) = GH_PROXY_IPV4_NODE.get() {
+		builder = builder.resolve(GH_PROXY_HOST, *ipv4_node);
+	}
+
+	builder
+		.https_only(true) // Never follow a redirect down to plaintext HTTP
+		.connect_timeout(std::time::Duration::new(10, 0)) // Initial connection failure
+		.read_timeout(std::time::Duration::new(10, 0)) // Stall detection
+}
+
+/// 探测某个镜像源的下载速度；二进制源还会校验文件头，防止代理返回 LFS 指针之类的假文件
+async fn probe_mirror_speed(root: &str, filename: &str, validate_binary: bool, no_system_proxy: bool, ipv4_node: Option<SocketAddr>) -> Option<u64> {
+	let url = root.to_string() + filename;
+
+	let mut builder = reqwest::Client::builder();
+
+	if no_system_proxy {
+		builder = builder.no_proxy();
+	}
+
+	if let Some(ipv4_node) = ipv4_node {
+		builder = builder.resolve(GH_PROXY_HOST, ipv4_node);
+	}
+
+	let client = builder
+		.https_only(true)
+		.connect_timeout(std::time::Duration::new(10, 0))
+		.read_timeout(std::time::Duration::new(10, 0))
+		.build()
+		.ok()?;
+
+	let started = Instant::now();
+
+	let probe_result = tokio::time::timeout(SPEED_TEST_TIMEOUT, async {
+		let response = client.get(url).send().await.ok()?;
+
+		if response.status().as_u16() != 200 {
+			return None;
+		}
+
+		let mut response = response;
+		let mut buf: Vec<u8> = Vec::with_capacity(response.content_length().unwrap_or(0) as usize);
+
+		while let Some(chunk) = response.chunk().await.ok().flatten() {
+			buf.extend_from_slice(&chunk);
+
+			if buf.len() >= SPEED_TEST_MAX_BYTES {
+				break;
+			}
+		}
+
+		if buf.is_empty() {
+			return None;
+		}
+
+		// BSDIFF40 或 Zstd 魔数；都不是就说明源返回了假文件（例如 GitHub LFS 指针）
+		if validate_binary && !(buf.starts_with(b"BSDIFF40") || buf.starts_with(&[0x28, 0xB5, 0x2F, 0xFD])) {
+			return None;
+		}
+
+		Some(buf.len() as u64)
+	}).await;
+
+	let received = match probe_result {
+		Ok(Some(received)) => received,
+		_ => return None
+	};
+
+	let elapsed = started.elapsed().as_secs_f64();
+
+	if elapsed <= 0.0 {
+		return None;
+	}
+
+	Some((received as f64 / elapsed) as u64)
+}
+
+/// 启动时自动检测各镜像源的下载速度：
+/// gh-proxy（IPv4 优选节点）速度理想时优先使用，否则使用 scs.mf.nekogan.com
+async fn select_mirror_sources<W>(writer: fn() -> W, writer_is_interactive: bool, no_system_proxy: bool) -> MirrorSelection
+where
+	W: std::io::Write + 'static
+{
+	terminal_write(writer, "\n正在自动检测镜像源下载速度...", true, None);
+
+	// 解析 gh-proxy 的全部 IPv4 节点并逐个测速，选出最快节点
+	let mut best_gh_proxy_node: Option<(SocketAddr, u64)> = None;
+
+	for ipv4_node in resolve_ipv4_nodes(GH_PROXY_HOST).await {
+		if let Some(speed) = probe_mirror_speed(GH_PROXY_TEXT_ROOT, SPEED_TEST_TEXT_FILE, false, no_system_proxy, Some(ipv4_node)).await {
+			let is_faster = match best_gh_proxy_node {
+				Some((_, best_speed)) => speed > best_speed,
+				None => true
+			};
+
+			if is_faster {
+				best_gh_proxy_node = Some((ipv4_node, speed));
+			}
+		}
+	}
+
+	let gh_proxy_text_speed = match best_gh_proxy_node {
+		Some((ipv4_node, speed)) => {
+			let _ = GH_PROXY_IPV4_NODE.set(ipv4_node);
+			terminal_write(writer, format!("gh-proxy IPv4 优选节点: {ipv4_node}（{:.2} MiB/s）", speed as f64 / 0x100000 as f64).as_str(), true, if writer_is_interactive { Some("cyan") } else { None });
+			Some(speed)
+		},
+		None => probe_mirror_speed(GH_PROXY_TEXT_ROOT, SPEED_TEST_TEXT_FILE, false, no_system_proxy, None).await
+	};
+
+	let gh_proxy_binary_speed = probe_mirror_speed(GH_PROXY_BINARY_ROOT, SPEED_TEST_BINARY_FILE, true, no_system_proxy, GH_PROXY_IPV4_NODE.get().copied()).await;
+	let nekogan_text_speed = probe_mirror_speed(NEKOGAN_TEXT_ROOT, SPEED_TEST_TEXT_FILE, false, no_system_proxy, None).await;
+	let nekogan_binary_speed = probe_mirror_speed(NEKOGAN_BINARY_ROOT, SPEED_TEST_BINARY_FILE, true, no_system_proxy, None).await;
+
+	// 文本源（version.txt / manifest.json）：gh-proxy 速度理想且不慢于备用源时优先
+	let gh_text_good = match (gh_proxy_text_speed, nekogan_text_speed) {
+		(Some(gh_speed), Some(nekogan_speed)) => gh_speed >= GOOD_SPEED_BYTES_PER_SEC && gh_speed >= nekogan_speed,
+		(Some(gh_speed), None) => gh_speed >= GOOD_SPEED_BYTES_PER_SEC,
+		(None, _) => false
+	};
+
+	let text_roots: &'static [&'static str] = if gh_text_good {
+		&GH_PROXY_FIRST_TEXT_ROOTS
+	} else if gh_proxy_text_speed.is_some() {
+		&NEKOGAN_FIRST_TEXT_ROOTS
+	} else {
+		&NEKOGAN_ONLY_TEXT_ROOTS
+	};
+
+	// 补丁源：只有 gh-proxy 能真正下载二进制文件且速度理想时才优先；
+	// 否则只用 scs.mf.nekogan.com，避免代理返回 LFS 指针导致校验失败
+	let gh_binary_good = match (gh_proxy_binary_speed, nekogan_binary_speed) {
+		(Some(gh_speed), Some(nekogan_speed)) => gh_speed >= GOOD_SPEED_BYTES_PER_SEC && gh_speed >= nekogan_speed,
+		(Some(gh_speed), None) => gh_speed >= GOOD_SPEED_BYTES_PER_SEC,
+		(None, _) => false
+	};
+
+	let binary_roots: &'static [&'static str] = if gh_binary_good {
+		&GH_PROXY_FIRST_BINARY_ROOTS
+	} else {
+		&NEKOGAN_ONLY_BINARY_ROOTS
+	};
+
+	let format_speed = |speed: Option<u64>| -> String {
+		match speed {
+			Some(speed) => format!("{:.2} MiB/s", speed as f64 / 0x100000 as f64),
+			None => "不可用".to_string()
+		}
+	};
+
+	terminal_write(writer, format!("gh-proxy.com（IPv4 优选）: 文本 {}，补丁 {}", format_speed(gh_proxy_text_speed), format_speed(gh_proxy_binary_speed)).as_str(), true, None);
+	terminal_write(writer, format!("scs.mf.nekogan.com: 文本 {}，补丁 {}", format_speed(nekogan_text_speed), format_speed(nekogan_binary_speed)).as_str(), true, None);
+	terminal_write(writer, format!("已选择文本源: {}", text_roots.iter().map(|root| root.to_string()).collect::<Vec<_>>().join(" -> ")).as_str(), true, if writer_is_interactive { Some("green") } else { None });
+	terminal_write(writer, format!("已选择补丁源: {}", binary_roots.iter().map(|root| root.to_string()).collect::<Vec<_>>().join(" -> ")).as_str(), true, if writer_is_interactive { Some("green") } else { None });
+
+	MirrorSelection {
+		text_roots,
+		binary_roots
+	}
+}
+
 async fn get_http_response<W>(writer: fn() -> W, writer_is_interactive: bool, servers: &[&str], filename: &str, mut server_id: u8, mut try_count: u8, no_system_proxy: bool) -> Option<Response>
 where
 	W: std::io::Write + 'static
@@ -377,16 +576,7 @@ where
 	while (server_id as usize) < servers.len() {
 		let url = servers[server_id as usize].to_string() + filename;
 
-		let mut builder = reqwest::Client::builder();
-
-		if no_system_proxy {
-			builder = builder.no_proxy();
-		}
-
-		let client = builder
-			.https_only(true) // Never follow a redirect down to plaintext HTTP
-			.connect_timeout(std::time::Duration::new(10, 0)) // Initial connection failure
-			.read_timeout(std::time::Duration::new(10, 0)) // Stall detection
+		let client = http_client_builder(no_system_proxy)
 			//.timeout(std::time::Duration::new(size, 0)) // TODO: Total DEADLINE timeout (downloading too slow)
 			.build();
 
@@ -410,7 +600,7 @@ where
 			},
 			Err(error) => {
 				let error = error.without_url();
-				terminal_write(writer, format!("\n{url}\n\tHTTP 出错: {error}\n\n当前重试次数：{try_count}。\n你无需担心，失败三次后会更换 CDN 备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\n{url}\n\tHTTP 出错: {error}\n\n当前重试次数：{try_count}。\n无需担心，连续失败三次后会自动切换备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 				response = None;
 				try_count += 1;
 
@@ -474,7 +664,7 @@ where
 					break;
 				},
 				Some(error) => {
-					terminal_write(writer, format!("\nHTTP 字节错误: {error}\n\n当前重试次数：{try_count}。\n你无需担心，失败三次后会更换 CDN 备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+					terminal_write(writer, format!("\nHTTP 字节错误: {error}\n\n当前重试次数：{try_count}。\n无需担心，连续失败三次后会自动切换备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 					response_bytes = None;
 					try_count += 1;
 
@@ -515,7 +705,7 @@ where
 					break;
 				},
 				Err(error) => {
-					terminal_write(writer, format!("\nHTTP 文本错误: {error}\n\n当前重试次数：{try_count}。\n你无需担心，失败三次后会更换 CDN 备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+					terminal_write(writer, format!("\nHTTP 文本错误: {error}\n\n当前重试次数：{try_count}。\n无需担心，连续失败三次后会自动切换备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 					response_text = None;
 					try_count += 1;
 
@@ -557,7 +747,7 @@ where
 					break;
 				},
 				Err(error) => {
-					terminal_write(writer, format!("\nHTTP JSON 错误: {error}\n\n当前重试次数：{try_count}。\n你无需担心，失败三次后会更换 CDN 备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+					terminal_write(writer, format!("\nHTTP JSON 错误: {error}\n\n当前重试次数：{try_count}。\n无需担心，连续失败三次后会自动切换备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 					response_json = None;
 					try_count += 1;
 
@@ -615,7 +805,7 @@ fn determine_file_integrity_status(gmod_path: PathBuf, filename: &str, hashes: &
 	}
 }
 
-async fn download_file_to_cache<W>(writer: fn() -> W, writer_is_interactive: bool, bar: ProgressBar, cache_dir: PathBuf, filename: String, target_hash: String, no_system_proxy: bool) -> Result<(), ()>
+async fn download_file_to_cache<W>(writer: fn() -> W, writer_is_interactive: bool, bar: ProgressBar, cache_dir: PathBuf, servers: &[&str], filename: String, target_hash: String, no_system_proxy: bool) -> Result<(), ()>
 where
 	W: std::io::Write + 'static
 {
@@ -629,7 +819,7 @@ where
 	let cache_file_path = extend_pathbuf_and_return(cache_dir, &file_parts[..]);
 	let cache_file_path_result = path_to_canonical_pathbuf(&cache_file_path, false);
 
-	terminal_write(writer, format!("\t下载中: {filename} ...").as_str(), true, None);
+	terminal_write(writer, format!("\t正在下载: {filename} ...").as_str(), true, None);
 
 	// Look in the cache to see if the file already exists
 	if cache_file_path_result.is_ok() {
@@ -637,13 +827,13 @@ where
 
 		if let Ok(file_hash) = file_hash_result
 			&& file_hash == target_hash {
-				terminal_write(writer, format!("\t已通过缓存加载: {filename}").as_str(), true, Some("green"));
+				terminal_write(writer, format!("\t已从缓存加载: {filename}").as_str(), true, Some("green"));
 				return Ok(());
 			}
 	}
 
 	// If it's not in the cache, or there's a checksum mismatch with the version in the cache, (re-)download it
-	let response_bytes = get_http_response_bytes(writer, writer_is_interactive, &bar, &BINARY_SERVER_ROOTS, filename.as_str(), no_system_proxy).await;
+	let response_bytes = get_http_response_bytes(writer, writer_is_interactive, &bar, servers, filename.as_str(), no_system_proxy).await;
 	if let Some(response_bytes) = response_bytes {
 		// Create directories if needed
 		let mut cache_file_path_dir = cache_file_path.clone();
@@ -662,7 +852,7 @@ where
 		// Decompress Zstandard files
 		let mut bytes: Vec<u8> = if filename.ends_with(".zst") { Vec::new() } else { response_bytes.to_vec() };
 		if filename.ends_with(".zst") {
-			terminal_write(writer, format!("\t解压中: {filename} ...").as_str(), true, None);
+			terminal_write(writer, format!("\t正在解压: {filename} ...").as_str(), true, None);
 
 			let decompress_result = zstd::stream::copy_decode(&response_bytes[..], &mut bytes);
 			if let Err(error) = decompress_result {
@@ -715,7 +905,7 @@ fn patch_file<W>(
 where
 	W: std::io::Write + 'static
 {
-	terminal_write(writer, format!("\t修补中: {filename} ...").as_str(), true, None);
+				terminal_write(writer, format!("\t正在修补: {filename} ...").as_str(), true, None);
 
 	let mut new_integrity_status: IntegrityStatus = *integrity_status;
 	let mut integrity_status_string = integrity_status_strings[&new_integrity_status];
@@ -728,7 +918,7 @@ where
 	if new_integrity_status == IntegrityStatus::NeedDelete {
 		if let Err(delete_error) = std::fs::remove_file(&gmod_file_path)
 			&& let Err(truncate_error) = File::create(&gmod_file_path) {
-				terminal_write(writer, format!("\t修补时出现问题: {filename} | {integrity_status_string}:\n\t删除: {delete_error}\n\t拦截: {truncate_error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t修补时出现问题: {filename} | {integrity_status_string}:\n\t删除: {delete_error}\n\t截断: {truncate_error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 				return new_integrity_status;
 			}
 
@@ -964,7 +1154,7 @@ where
 				if let Some(existing_pid) = existing_pid
 					&& let Some(process) = sys.process(sysinfo::Pid::from(existing_pid))
 						&& process.name().to_string_lossy().starts_with("gmodpatchtool") {
-							return Err(AlmightyError::Generic(format!("已经有一个 GModPatchTool 程序在运行了！进程PID：({existing_pid}).")));
+							return Err(AlmightyError::Generic(format!("已有 GModPatchTool 正在运行（进程 PID: {existing_pid}）！")));
 						}
 
 				// Stale lockfile (crashed run or recycled PID); remove it and retry
@@ -976,16 +1166,19 @@ where
 		}
 	}
 
+	// 启动时自动检测镜像源下载速度：优先 gh-proxy（IPv4 优选节点），速度不理想则退回 scs.mf.nekogan.com
+	let mirror_selection = select_mirror_sources(writer, writer_is_interactive, args.no_system_proxy).await;
+
 	// Get local version
 	let local_version: u32 = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap();
 
 	// Get remote version
 	terminal_write(writer, "正在获取最新版本信息...\n", true, None);
 
-	let remote_version = get_http_response_text(writer, writer_is_interactive, &TEXT_SERVER_ROOTS, "version.txt", args.no_system_proxy).await;
+	let remote_version = get_http_response_text(writer, writer_is_interactive, &mirror_selection.text_roots, "version.txt", args.no_system_proxy).await;
 
 	if remote_version.is_none() {
-		return Err(AlmightyError::Generic("获取最新版本时出错，请检查你的网络链接".to_string()));
+		return Err(AlmightyError::Generic("获取最新版本时出错，请检查你的网络连接".to_string()));
 	}
 
 	let remote_version = remote_version.unwrap();
@@ -996,7 +1189,7 @@ where
 	if local_version >= remote_version {
 		terminal_write(writer, format!("🎉恭喜，你正在运行最新版的 GModPatchTool\n[当前版本: {local_version} / 最新版本: {remote_version}]!\n").as_str(), true, if writer_is_interactive { Some("green") } else { None });
 	} else {
-		terminal_write(writer, "⚠️警告: GModPatchTool 有新版本啦！我们推荐你下载最新版本以获取到更多新内容！\nhttps://juice.catkim.xyz/index.php/gmodcefcodecfix/", true, if writer_is_interactive { Some("red") } else { None });
+		terminal_write(writer, "⚠️警告: GModPatchTool 有新版本啦！建议下载最新版本以获取更多新内容！\nhttps://juice.catkim.xyz/index.php/gmodcefcodecfix/", true, if writer_is_interactive { Some("red") } else { None });
 
 		let mut secs_to_continue: u8 = 5;
 		while secs_to_continue > 0 {
@@ -1022,7 +1215,7 @@ where
 	if root {
 		if args.run_as_root_with_security_risk {
 			terminal_write(writer, "⚠️警告: 你当前正以管理员身份运行 GModPatchTool！这是没有必要的，而且会导致一些不该出现的问题！", true, if writer_is_interactive { Some("red") } else { None });
-	terminal_write(writer, "（镜像版吐槽：Python时代的GCCF怎么没有问题？）", true, None);
+	terminal_write(writer, "（镜像版吐槽：Python 时代的 GCCF 怎么没有问题？）", true, None);
 
 			let mut secs_to_continue: u8 = 10;
 			while secs_to_continue > 0 {
@@ -1037,7 +1230,7 @@ where
 				terminal_write(writer, "\x1B[0K\n", false, None);
 			}
 		} else {
-			let elevated_msg = format!("你当前正以管理员身份运行 GModPatchTool{}，这是没有必要的，而且会导致一些不该出现的问题！\n\n如果你知道你在做什么，你可以通过添加启动项 --run-as-root-with-security-risk 来继续运行该程序，程序即将退出...", if cfg!(windows) { "\n (如果你坚信你没有使用管理员权限运行，那么UAC账户控制很可能已被关闭！)" } else { "" });
+			let elevated_msg = format!("你当前正以管理员身份运行 GModPatchTool{}，这是没有必要的，而且会导致一些不该出现的问题！\n\n如确认操作无误，可以添加启动参数 --run-as-root-with-security-risk 继续运行；程序即将退出...", if cfg!(windows) { "\n（如果你确定没有使用管理员权限运行，那么 UAC 账户控制可能已被关闭！）" } else { "" });
 			return Err(AlmightyError::Generic(elevated_msg));
 		}
 	}
@@ -1147,11 +1340,11 @@ where
 						valid_steam_paths_str += &pathbuf.to_string_lossy();
 					}
 
-					terminal_write(writer, format!("⚠️警告: 检测到多个 Steam 安装路径！这可能会导致一些问题:{valid_steam_paths_str}").as_str(), true, if writer_is_interactive { Some("yellow") } else { None });
+					terminal_write(writer, format!("⚠️警告: 检测到多个 Steam 安装路径！这可能会导致一些问题：{valid_steam_paths_str}").as_str(), true, if writer_is_interactive { Some("yellow") } else { None });
 
 					let mut secs_to_continue: u8 = 5;
 					while secs_to_continue > 0 {
-						terminal_write(writer, format!("\t词条警告还会继续显示 {secs_to_continue} 秒...\r").as_str(), false, if writer_is_interactive { Some("yellow") } else { None });
+						terminal_write(writer, format!("\t该警告还会继续显示 {secs_to_continue} 秒...\r").as_str(), false, if writer_is_interactive { Some("yellow") } else { None });
 						writer().flush().unwrap();
 						tokio::time::sleep(time::Duration::from_secs(1)).await;
 						secs_to_continue -= 1;
@@ -1169,7 +1362,7 @@ where
 	}
 
 	if steam_path.is_none() {
-		return Err(AlmightyError::Generic("❌错误：未找到 Steam 安装路径，如果你坚信你装了，尽管可能手段不太光明，你可以通过添加参数 --steam-path 来指定 Steam 的安装路径".to_string()));
+		return Err(AlmightyError::Generic("❌未找到 Steam 安装路径！如果你确定已经安装，可以添加参数 --steam-path 手动指定 Steam 的安装路径。".to_string()));
 	}
 
 	let steam_path = steam_path.unwrap();
@@ -1182,7 +1375,7 @@ where
 	let steam_loginusers_bytes = tokio::fs::read(steam_loginusers_path).await;
 
 	if steam_loginusers_bytes.is_err() {
-		return Err(AlmightyError::Generic("❌loginusers.vdf 去异世界旅游了！也许它从来就没有出生过？你可以通过尝试重新登录 Steam 来召回它，或许你也可以摆个法阵来召唤。".to_string()));
+		return Err(AlmightyError::Generic("❌loginusers.vdf 去异世界旅游了！它可能从未存在过，也可能只是走丢了。可以尝试重新登录 Steam 把它召回来，或者摆个法阵召唤一下。".to_string()));
 	}
 
 	// loginusers.vdf can hold invalid UTF-8 (truncated persona names), so decode lossily
@@ -1190,7 +1383,7 @@ where
 	let steam_loginusers = vdf::from_str(steam_loginusers_str.as_str());
 
 	if let Err(error) = steam_loginusers {
-		return Err(AlmightyError::Generic(format!("❌loginusers.vdf 发生了血肉畸变！我们不认识它了！\n\t{error}")));
+		return Err(AlmightyError::Generic(format!("❌loginusers.vdf 发生了血肉畸变，我们已经不认识它了！\n\t{error}")));
 	}
 
 	let mut steam_user: HashMap<&str, String> = HashMap::new();
@@ -1220,7 +1413,7 @@ where
 
 	let steam_id = steam_user.get("SteamID64").unwrap().parse::<u64>().ok().and_then(|steam_id_64| SteamId::new(steam_id_64).ok());
 	let Some(steam_id) = steam_id else {
-		return Err(AlmightyError::Generic("❌loginusers.vdf 发生了血肉畸变！我们不认识它了！".to_string()));
+		return Err(AlmightyError::Generic("❌loginusers.vdf 发生了血肉畸变，我们已经不认识它了！".to_string()));
 	};
 
 	terminal_write(writer, format!("Steam User: {} ({} / {})\n", steam_user.get("PersonaName").unwrap(), steam_user.get("SteamID64").unwrap(), steam_id.steam3id()).as_str(), true, None);
@@ -1242,14 +1435,14 @@ where
 	}
 
 	if steam_libraryfolders_str.is_err() {
-		return Err(AlmightyError::Generic("❌libraryfolders.vdf 去异世界旅游了！也许它从来就没有出生过？你可以通过尝试重新登录 Steam 来召回它，或许你也可以摆个法阵来召唤。".to_string()));
+		return Err(AlmightyError::Generic("❌libraryfolders.vdf 去异世界旅游了！它可能从未存在过，也可能只是走丢了。可以尝试重新登录 Steam 把它召回来，或者摆个法阵召唤一下。".to_string()));
 	}
 
 	let steam_libraryfolders_str = steam_libraryfolders_str.unwrap();
 	let steam_libraryfolders = vdf::from_str(steam_libraryfolders_str.as_str());
 
 	if let Err(error) = steam_libraryfolders {
-		return Err(AlmightyError::Generic(format!("❌libraryfolders.vdf 发生了血肉畸变！我们不认识它了！\n\t{error}")));
+		return Err(AlmightyError::Generic(format!("❌libraryfolders.vdf 发生了血肉畸变，我们已经不认识它了！\n\t{error}")));
 	}
 
 	// Get GMod Steam Library and Manifest
@@ -1288,14 +1481,14 @@ where
 
 	//gmod_steam_library_path.is_none() ||
 	if gmod_manifest_str.is_none() {
-		return Err(AlmightyError::Generic("❌未找到 appmanifest_4000.acf！\n😭啊 GMod 你怎么似了！".to_string()));
+		return Err(AlmightyError::Generic("❌未找到 appmanifest_4000.acf！\n😭啊，GMod 你怎么似了！".to_string()));
 	}
 
 	let gmod_manifest_str = gmod_manifest_str.unwrap();
 	let gmod_manifest = vdf::from_str(gmod_manifest_str.as_str());
 
 	if let Err(error) = gmod_manifest {
-		return Err(AlmightyError::Generic(format!("❌无法解析 appmanifest_4000.acf！\n😭啊 GMod 你怎么似了！\n\t{error}")));
+		return Err(AlmightyError::Generic(format!("❌无法解析 appmanifest_4000.acf！\n😭啊，GMod 你怎么似了！\n\t{error}")));
 	}
 
 	let gmod_steam_library_path = gmod_steam_library_path.unwrap();
@@ -1317,7 +1510,7 @@ where
 	terminal_write(writer, format!("GMod 应用状态: {gmod_stateflags} | {gmod_scheduledautoupdate} | {gmod_fullvalidatebeforenextupdate} | {gmod_bytesdownloaded}/{gmod_bytestodownload} | {gmod_bytesstaged}/{gmod_bytestostage} \n").as_str(), true, None);
 
 	if gmod_stateflags != 4 || gmod_scheduledautoupdate != 0 || gmod_fullvalidatebeforenextupdate || gmod_bytesdownloaded != gmod_bytestodownload || gmod_bytesstaged != gmod_bytestostage {
-		return Err(AlmightyError::Generic("🤔看起来 Garry's Mod 还没有准备好！请检查 Steam > 下载 来确保 GMod 未在更新队列中！❓如果还是没用，可以试试把游戏打开再关闭！".to_string()));
+		return Err(AlmightyError::Generic("🤔看起来 Garry's Mod 还没有准备好！请在 Steam > 下载 中确认 GMod 不在更新队列中！❓如果仍然无效，可以试试把游戏打开再关闭！".to_string()));
 	}
 
 	// Get GMod branch
@@ -1339,7 +1532,7 @@ where
 	}
 
 	if gmod_path.is_err() {
-		return Err(AlmightyError::Generic("GMod安装了吗，对吗，不对不对！".to_string()));
+		return Err(AlmightyError::Generic("未找到 Garry's Mod 的安装目录！你确定安装过 GMod 吗？".to_string()));
 	}
 
 	let gmod_path = gmod_path.unwrap();
@@ -1353,7 +1546,7 @@ where
 	if root
 		&& let Ok(gmod_dir_meta) = tokio::fs::metadata(&gmod_path).await
 			&& gmod_dir_meta.uid() != 0 {
-				return Err(AlmightyError::Generic("恭喜你，你正以 root 身份运行 GModPatchTool！而你成功触发了先前的警告！ Garry's Mod 的安装目录的所有者并不属于 root，请重新分配目录权限，或使用其他账户运行该程序！\n程序即将退出...".to_string()));
+				return Err(AlmightyError::Generic("你正以 root 身份运行 GModPatchTool，并成功触发了之前的警告！Garry's Mod 安装目录的所有者不是 root，请重新分配目录权限，或改用其他账户运行本程序！\n程序即将退出...".to_string()));
 			}
 
 	// Determine target platform
@@ -1374,14 +1567,14 @@ where
 		let steam_config_str = tokio::fs::read_to_string(steam_config_path).await;
 
 		if steam_config_str.is_err() {
-			return Err(AlmightyError::Generic("❌config.vdf 去异世界旅游了！也许它从来就没有出生过？你可以通过尝试重新登录 Steam 来召回它，或许你也可以摆个法阵来召唤。".to_string()));
+		return Err(AlmightyError::Generic("❌config.vdf 去异世界旅游了！它可能从未存在过，也可能只是走丢了。可以尝试重新登录 Steam 把它召回来，或者摆个法阵召唤一下。".to_string()));
 		}
 
 		let steam_config_str = steam_config_str.unwrap();
 		let steam_config = vdf::from_str(steam_config_str.as_str());
 
 		if steam_config.is_err() {
-			return Err(AlmightyError::Generic("❌config.vdf 发生了血肉畸变！我们不认识它了！".to_string()));
+			return Err(AlmightyError::Generic("❌config.vdf 发生了血肉畸变，我们已经不认识它了！".to_string()));
 		}
 
 		let steam_config: SteamConfig = steam_config.unwrap();
@@ -1408,7 +1601,7 @@ where
 	let steam_user_localconfig_bytes = tokio::fs::read(steam_user_localconfig_path).await;
 
 	if let Err(error) = steam_user_localconfig_bytes {
-		return Err(AlmightyError::Generic(format!("❌localconfig.vdf 去异世界旅游了！也许它从来就没有出生过？你可以通过尝试重新登录 Steam 来召回它，或许你也可以摆个法阵来召唤。\n\t{error}")));
+		return Err(AlmightyError::Generic(format!("❌localconfig.vdf 去异世界旅游了！它可能从未存在过，也可能只是走丢了。可以尝试重新登录 Steam 把它召回来，或者摆个法阵召唤一下。\n\t{error}")));
 	}
 
 	// localconfig.vdf can hold invalid UTF-8 (Steam truncates friend persona names mid-codepoint), so decode lossily
@@ -1417,7 +1610,7 @@ where
 	let steam_user_localconfig = vdf::from_str(steam_user_localconfig_str.as_str());
 
 	if let Err(error) = steam_user_localconfig {
-		return Err(AlmightyError::Generic(format!("❌localconfig.vdf 发生了血肉畸变！我们不认识它了！\n\t{error}")));
+		return Err(AlmightyError::Generic(format!("❌localconfig.vdf 发生了血肉畸变，我们已经不认识它了！\n\t{error}")));
 	}
 
 	let steam_user_localconfig: SteamUserLocalConfig = steam_user_localconfig.unwrap();
@@ -1426,11 +1619,11 @@ where
 	if let Some(steam_user_localconfig_gmod) = steam_user_localconfig_gmod {
 		if let Some(steam_user_localconfig_gmod_launchopts) = &steam_user_localconfig_gmod.launch_options
 			&& steam_user_localconfig_gmod_launchopts.contains("-nochromium") {
-				terminal_write(writer, "⚠️警告: 侦测到 GMod 启动项 -nochromium！CEF 和它水火不容！\n\t请前往 Steam > Garry's Mod > 属性 > 通用 中移除它！\n\t此外，如果你安装了 gmod-lua-menu，请将其卸载", true, if writer_is_interactive { Some("yellow") } else { None });
+				terminal_write(writer, "⚠️警告: 检测到 GMod 启动参数 -nochromium！CEF 与它水火不容！\n\t请在 Steam > Garry's Mod > 属性 > 通用 中移除该参数！\n\t此外，如果安装了 gmod-lua-menu，请一并卸载。", true, if writer_is_interactive { Some("yellow") } else { None });
 
 				let mut secs_to_continue: u8 = 5;
 				while secs_to_continue > 0 {
-					terminal_write(writer, format!("\t词条警告还会继续显示 {secs_to_continue} 秒...\r").as_str(), false, if writer_is_interactive { Some("yellow") } else { None });
+					terminal_write(writer, format!("\t该警告还会继续显示 {secs_to_continue} 秒...\r").as_str(), false, if writer_is_interactive { Some("yellow") } else { None });
 					writer().flush().unwrap();
 					tokio::time::sleep(time::Duration::from_secs(1)).await;
 					secs_to_continue -= 1;
@@ -1448,7 +1641,7 @@ where
 	// Get remote manifest
 	terminal_write(writer, "获取远程文件中...", true, None);
 
-	let remote_manifest = get_http_response_json::<_, Manifest>(writer, writer_is_interactive, &TEXT_SERVER_ROOTS, "manifest.json", args.no_system_proxy).await;
+	let remote_manifest = get_http_response_json::<_, Manifest>(writer, writer_is_interactive, &mirror_selection.text_roots, "manifest.json", args.no_system_proxy).await;
 
 	if remote_manifest.is_none() {
 		terminal_write(writer, "", true, None); // Newline
@@ -1466,7 +1659,7 @@ where
 
 	let platform_branch_files = platform_branches.unwrap().get(&gmod_branch);
 	if platform_branch_files.is_none() {
-		return Err(AlmightyError::Generic(format!("喵喵亲，请先把你的GMod测试版设置成 x86_64！你当前的测试版：({gmod_branch}) 不受支持！")));
+		return Err(AlmightyError::Generic(format!("喵喵亲，请先把你的 GMod 测试版设置为 x86_64！当前测试版 ({gmod_branch}) 不受支持！")));
 	}
 
 	let platform_branch_files = platform_branch_files.unwrap();
@@ -1607,12 +1800,12 @@ where
 		for (filename, integrity_status, hashes) in &pending_files {
 			// Need Original
 			if *integrity_status == IntegrityStatus::NeedOriginal {
-				download_futures.spawn(download_file_to_cache(writer, writer_is_interactive, download_bar.clone(), cache_dir.clone(), format!("originals/{platform_masked}/{gmod_branch}/{filename}.zst"), hashes["original"].clone(), args.no_system_proxy));
+				download_futures.spawn(download_file_to_cache(writer, writer_is_interactive, download_bar.clone(), cache_dir.clone(), &mirror_selection.binary_roots, format!("originals/{platform_masked}/{gmod_branch}/{filename}.zst"), hashes["original"].clone(), args.no_system_proxy));
 			}
 
 			// Need Fix (we filtered out IntegrityStatus::Fixed above, but we still need IntegrityStatus::NeedDelete for later)
 			if *integrity_status != IntegrityStatus::NeedDelete {
-				download_futures.spawn(download_file_to_cache(writer, writer_is_interactive, download_bar.clone(), cache_dir.clone(), format!("patches/{platform_masked}/{gmod_branch}/{filename}.bsdiff"), hashes["patch"].clone(), args.no_system_proxy));
+				download_futures.spawn(download_file_to_cache(writer, writer_is_interactive, download_bar.clone(), cache_dir.clone(), &mirror_selection.binary_roots, format!("patches/{platform_masked}/{gmod_branch}/{filename}.bsdiff"), hashes["patch"].clone(), args.no_system_proxy));
 			}
 		}
 
@@ -1865,10 +2058,10 @@ where
 
 	// Keep the emoji outside the colored span: bold color codes break color emoji in the GUI terminal
 	terminal_write(writer, "\n💖 ", false, None);
-	terminal_write(writer, "你是否认为该工具很好用？请在下面的链接支持我们！", true, if writer_is_interactive { Some("magenta") } else { None });
+	terminal_write(writer, "觉得这个工具好用的话，请通过下面的链接支持我们！", true, if writer_is_interactive { Some("magenta") } else { None });
 	terminal_write(writer, "\t软件原作者 > https://solsticegamestudios.com/donate/", true, None);
-	terminal_write(writer, "\n\n软件的运营需要成本，如果你有能力的话请帮帮我们！", true, if writer_is_interactive { Some("magenta") } else { None });
-	terminal_write(writer, "\t赞助链接 > https://blog.nekogan.com/1779011106565", true, None);
+	terminal_write(writer, "\n\n软件的运营需要成本，如果你有能力，请帮帮我们！", true, if writer_is_interactive { Some("magenta") } else { None });
+	terminal_write(writer, "\t赞助链接 > https://afdian.com/a/eh5here", true, None);
 	terminal_write(writer, "\n求求啦，谢谢啦 🙏🙏🙏", true, None);
 
 	Ok(())
@@ -1904,14 +2097,14 @@ fn rosetta_prewarm_child() {
 				if dlopen_result.is_null() {
 					let dlopen_error = unsafe { dlerror() };
 					let dlopen_error = if dlopen_error.is_null() { std::borrow::Cow::from("未知错误") } else { unsafe { std::ffi::CStr::from_ptr(dlopen_error) }.to_string_lossy() };
-					println!("\t翻译失败: {} | {dlopen_error}", path.to_string_lossy());
+					println!("\t转译失败: {} | {dlopen_error}", path.to_string_lossy());
 					prewarm_failed = true;
 				} else {
-					println!("\t已翻译: {}", path.to_string_lossy());
+					println!("\t已转译: {}", path.to_string_lossy());
 				}
 			},
 			Err(error) => {
-				println!("\t翻译失败: {} | {error}", path.to_string_lossy());
+				println!("\t转译失败: {} | {error}", path.to_string_lossy());
 				prewarm_failed = true;
 			}
 		}
@@ -1936,7 +2129,7 @@ fn delete_pid_lockfile() {
 }
 
 fn terminal_exit_handler() {
-	println!("\n按下 回车键 退出程序...");
+	println!("\n按回车键退出程序...");
 	std::io::stdin().read_line(&mut String::new()).unwrap();
 	delete_pid_lockfile();
 }

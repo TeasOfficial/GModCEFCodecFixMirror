@@ -20,7 +20,7 @@ GModPatchTool (formerly GModCEFCodecFix)
 版权所有 2020-2025, Solstice Game Studios (solsticegamestudios.com)
 开源协议 GNU General Public License v3.0
 
-修复：初雪 OriginalSnow
+维护：初雪 OriginalSnow
 
 
 国内发行版联系方式：

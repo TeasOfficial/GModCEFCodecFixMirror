@@ -7,7 +7,7 @@
 	目的：检测 GModPatchTool 的 CEF 补丁是否已成功应用于 GMod 客户端
 
 	联系我们:
-		仓库: https://github.com/TeasOfficial/GModPatchToolMirror/
+		仓库: https://github.com/TeasOfficial/GModCEFCodecFixMirror/
 		Discord: https://solsticegamestudios.com/discord/
 		邮箱: contact@solsticegamestudios.com
 ]]

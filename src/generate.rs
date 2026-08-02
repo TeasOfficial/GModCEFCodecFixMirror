@@ -34,13 +34,20 @@ fn get_files_recursive(source: &str, path_base: String, files: &mut HashMap<Stri
 
 		// TODO: Move gmod-update.txt from these directories
 		if entry_filename != "gmod-update.txt" {
-			let source = if entry_filename.contains(".sym") { "symbol" } else { source };
-			let entry_filename = if entry_filename.contains(".sym") { entry_filename.replace(".sym", "") } else { entry_filename };
+			let source = if entry_filename.ends_with(".sym") { "symbol" } else { source };
+			let entry_filename = if let Some(entry_filename) = entry_filename.strip_suffix(".sym") { entry_filename.to_string() } else { entry_filename };
 			let entry_relative_path_str = if path_base.is_empty() { entry_filename } else { format!("{path_base}/{entry_filename}") };
 
 			if entry_path.is_dir() {
 				get_files_recursive(source, entry_relative_path_str, files, entry_path);
 			} else if entry_path.is_file() {
+				// Files must sit under platform/branch/ or the manifest build misfiles them
+				if entry_relative_path_str.split("/").count() < 3 {
+					println!("Unexpected file outside a platform/branch directory: {}", entry_path.to_string_lossy());
+					println!("FATAL ERROR, EXITING...");
+					std::process::exit(1);
+				}
+
 				let file_hashmap = files.get_mut(&entry_relative_path_str);
 
 				match file_hashmap {
@@ -99,24 +106,35 @@ fn hash_diff_compress_file(patch_dest: PathBuf, filename: &String, file_paths: &
 		let original = original.unwrap();
 		let fixed = fixed.unwrap();
 
+		// A git-lfs pointer means LFS wasn't checked out; diffing it would ship corruption to every user
+		if original.starts_with(b"version https://git-lfs") || fixed.starts_with(b"version https://git-lfs") {
+			return Err((true, "git-lfs pointer file (is git-lfs installed and checked out?)".to_string()));
+		}
+
 		// Figure out if the fixed file is an executable, and if so, mark it
 		let mut executable = false;
 
 		// MZ (Windows, technically DOS but not going to dig for PE header)
 		// 0x4D 0x5A
-		if fixed[0x00] == b'M' && fixed[0x01] == b'Z' {
+		if fixed.starts_with(b"MZ") {
 			executable = true;
 		}
 
 		// ELF (Linux)
 		// 0x7F 0x45 0x4C 0x46
-		if fixed[0x00] == 0x7F && fixed[0x01] == b'E' && fixed[0x02] == b'L' && fixed[0x03] == b'F' {
+		if fixed.starts_with(&[0x7F, b'E', b'L', b'F']) {
 			executable = true;
 		}
 
-		// Mach-O (macOS)
-		// 0xCF 0xFA 0xED 0xFE
-		if fixed[0x00] == 0xCF && fixed[0x01] == 0xFA && fixed[0x02] == 0xED && fixed[0x03] == 0xFE {
+		// Mach-O (macOS): thin 64-bit and fat/universal
+		// 0xCF 0xFA 0xED 0xFE (thin) / 0xCA 0xFE 0xBA 0xBE (fat)
+		if fixed.starts_with(&[0xCF, 0xFA, 0xED, 0xFE]) || fixed.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE]) {
+			executable = true;
+		}
+
+		// Shebang scripts (hl2_osx, hl2.sh)
+		// 0x23 0x21
+		if fixed.starts_with(b"#!") {
 			executable = true;
 		}
 
@@ -249,11 +267,11 @@ pub fn main() {
 	// Parse the args (will also exit if something's wrong with them)
 	let args = Args::parse();
 
-	let original_src = pathbuf_to_canonical_pathbuf(args.original_src.clone(), true);
-	let fixed_src = pathbuf_to_canonical_pathbuf(args.fixed_src.clone(), true);
-	let patch_dest = pathbuf_to_canonical_pathbuf(args.patch_dest.clone(), false);
-	let original_dest = pathbuf_to_canonical_pathbuf(args.original_dest.clone(), false);
-	let symbol_dest = pathbuf_to_canonical_pathbuf(args.symbol_dest.clone(), false);
+	let original_src = path_to_canonical_pathbuf(&args.original_src, true);
+	let fixed_src = path_to_canonical_pathbuf(&args.fixed_src, true);
+	let patch_dest = path_to_canonical_pathbuf(&args.patch_dest, false);
+	let original_dest = path_to_canonical_pathbuf(&args.original_dest, false);
+	let symbol_dest = path_to_canonical_pathbuf(&args.symbol_dest, false);
 
 	let mut cmd = Args::command();
 	if let Err(original_src) = original_src {
@@ -330,6 +348,17 @@ pub fn main() {
 			"Original Dest cannot match Fixed Source.",
 		)
 		.exit();
+	}
+
+	// The dest dirs get wiped with remove_dir_all, so none may overlap a source directory or another dest
+	for (dest_name, dest) in [("Patch Dest", &patch_dest), ("Original Dest", &original_dest), ("Symbol Dest", &symbol_dest)] {
+		if dest.starts_with(&original_src) || original_src.starts_with(dest) || dest.starts_with(&fixed_src) || fixed_src.starts_with(dest) {
+			cmd.error(ErrorKind::ValueValidation, format!("{dest_name} cannot overlap a source directory.")).exit();
+		}
+	}
+
+	if patch_dest.starts_with(&original_dest) || original_dest.starts_with(&patch_dest) || patch_dest.starts_with(&symbol_dest) || symbol_dest.starts_with(&patch_dest) || original_dest.starts_with(&symbol_dest) || symbol_dest.starts_with(&original_dest) {
+		cmd.error(ErrorKind::ValueValidation, "Patch, Original, and Symbol Dest must not overlap.").exit();
 	}
 
 	let mut manifest_file_path = patch_dest.clone();

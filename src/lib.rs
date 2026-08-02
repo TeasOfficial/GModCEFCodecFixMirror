@@ -15,6 +15,7 @@ const ABOUT: &str = r#"   ________  ___          ______        __       __  ____
  / / __/ /|_/ / __ \/ __  / /_/ / __ `/ __/ ___/ __ \/ / / __ \/ __ \/ /
 / /_/ / /  / / /_/ / /_/ / ____/ /_/ / /_/ /__/ / / / / / /_/ / /_/ / /
 \____/_/  /_/\____/\__,_/_/    \__,_/\__/\___/_/ /_/_/  \____/\____/_/
+GModPatchTool (formerly GModCEFCodecFix)
 
 版权所有 2020-2025, Solstice Game Studios (solsticegamestudios.com)
 开源协议 GNU General Public License v3.0
@@ -31,6 +32,7 @@ const ABOUT: &str = r#"   ________  ___          ______        __       __  ____
 	> 申必の果茶店（QQ群）：920655299
 "#;
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use indexmap::IndexMap;
@@ -49,43 +51,19 @@ fn pathbuf_dir_not_empty(pathbuf: &Path) -> bool {
 	pathbuf_dir.is_ok() && pathbuf_dir.unwrap().next().is_some()
 }
 
-fn pathbuf_to_canonical_pathbuf(pathbuf: PathBuf, checkdirempty: bool) -> Result<PathBuf, String> {
+fn path_to_canonical_pathbuf(path: impl AsRef<Path>, checkdirempty: bool) -> io::Result<PathBuf> {
 	#[cfg(windows)]
 	use dunce::canonicalize;
 	#[cfg(not(windows))]
 	let canonicalize = Path::canonicalize;
 
-	let pathbuf_result = canonicalize(pathbuf.as_path());
+	let pathbuf = canonicalize(path.as_ref())?;
 
-	match pathbuf_result {
-		Ok(pathbuf) => {
-			if !checkdirempty || pathbuf_dir_not_empty(&pathbuf) {
-				Ok(pathbuf)
-			} else {
-				Err("Directory is empty".to_string())
-			}
-		},
-		Err(error) => {
-			Err(error.to_string())
-		}
-	}
-}
-
-fn string_to_canonical_pathbuf(path_str: String) -> Option<PathBuf> {
-	#[cfg(windows)]
-	use dunce::canonicalize;
-	#[cfg(not(windows))]
-	let canonicalize = Path::canonicalize;
-
-	let pathbuf_result = canonicalize(Path::new(&path_str));
-
-	if let Ok(pathbuf) = pathbuf_result {
-		if pathbuf_dir_not_empty(&pathbuf) {
-			return Some(pathbuf);
-		}
+	if checkdirempty && !pathbuf_dir_not_empty(&pathbuf) {
+		return Err(io::Error::other("Directory is empty"));
 	}
 
-	None
+	Ok(pathbuf)
 }
 
 fn extend_pathbuf_and_return(mut pathbuf: PathBuf, segments: &[&str]) -> PathBuf {

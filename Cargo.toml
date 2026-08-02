@@ -1,6 +1,6 @@
 [package]
 name = "gmodpatchtool"
-version = "20251102.0.0"
+version = "20260722.0.0"
 authors = ["Solstice Game Studios <contact@solsticegamestudios.com>", "Shinkarna <admin@nekogan.com>"]
 license = "GPL-3.0-only"
 edition = "2024"
@@ -11,28 +11,28 @@ ProductName = "GModPatchTool"
 LegalCopyright = "Solstice Game Studios <contact@solsticegamestudios.com>"
 
 [dependencies]
-anyhow = { version = "1.0" }
 blake3 = { version = "1.8", features = ["mmap", "rayon"] }
-bytes = { version = "1.10", optional = true }
+bytes = { version = "1.11", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = { version = "0.29" }
 dirs = { version = "6.0", optional = true }
-http = { version = "1.3", optional = true }
-iced = { version = "0.13", optional = true, features = ["image"] }
-iced_term = { version = "0.6", optional = true }
+iced = { version = "0.14", optional = true }
+iced_term = { version = "0.8", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+indicatif = { version = "0.18", optional = true }
 indexmap = { version = "2.12", features = ["rayon", "serde"] }
 keyvalues-serde = { version = "0.2", optional = true }
 open = { version = "5.3", optional = true }
-phf = { version = "0.13", features = ["macros"], optional = true }
+phf = { version = "0.14", features = ["macros"], optional = true }
 qbsdiff = "1.4"
 rayon = { version = "1.11" }
 regex = "1.12"
-reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls-native-roots", "json", "gzip", "brotli", "zstd", "socks"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls", "json", "gzip", "brotli", "zstd", "socks", "system-proxy"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 serde_path_to_error = { version = "0.1" }
-steamid = { version = "0.1", git = "https://github.com/JohnPeel/steamid", optional = true }
-sysinfo = { version = "0.37", optional = true }
+steamid = { version = "0.1", git = "https://github.com/JohnPeel/steamid", rev = "b19ddd38d9497329b9e3ba90ac27b267835161c3", optional = true }
+sysinfo = { version = "0.39", optional = true }
 thiserror = { version = "2.0", optional = true }
 tokio = { version = "1.48", features = ["full"], optional = true }
 tracing = { version = "0.1", optional = true }
@@ -48,21 +48,27 @@ win32console = "0.1"
 [features]
 default = ["patch"]
 #default = ["generate"]
-patch = ["dep:bytes", "dep:dirs", "dep:http", "dep:iced", "dep:iced_term", "dep:keyvalues-serde", "dep:open", "dep:phf", "dep:reqwest", "dep:steamid", "dep:sysinfo", "dep:thiserror", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:windows-registry"]
+patch = ["dep:bytes", "dep:dirs", "dep:iced", "dep:iced_term", "dep:image", "dep:indicatif", "dep:keyvalues-serde", "dep:open", "dep:phf", "dep:reqwest", "dep:steamid", "dep:sysinfo", "dep:thiserror", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "dep:windows-registry"]
 generate = []
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Line info for crash symbolication: in the pdb on Windows, the dSYM on macOS (CI packs it), and the binary on Linux
+debug = "line-tables-only"
 
 # Build config
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
-[target.'cfg(target_os = "macos")'.build-dependencies]
-cargo-packager = "0.11"
-
 [package.metadata.packager]
 product-name = "GModPatchTool"
 identifier = "com.solsticegamestudios.gmodpatchtool"
 license-file = "LICENSE.txt"
-before-packaging-command = "cargo build --release"
+# Build both arches + lipo so cargo-packager (target-triple below) bundles universal2
+before-packaging-command = "rustup target add aarch64-apple-darwin x86_64-apple-darwin && cargo build --release --locked --target aarch64-apple-darwin && cargo build --release --locked --target x86_64-apple-darwin && mkdir -p target/universal-apple-darwin/release && lipo -create -output target/universal-apple-darwin/release/gmodpatchtool target/aarch64-apple-darwin/release/gmodpatchtool target/x86_64-apple-darwin/release/gmodpatchtool"
+target-triple = "universal-apple-darwin"
 binaries = [
 	{ path = "gmodpatchtool", main = true }
 ]
@@ -71,7 +77,3 @@ resources = ["GModPatchToolLogo.icns"]
 icons = ["GModPatchToolLogo.icns"]
 macos = { minimum-system-version = "11.0" }
 #dmg = { background = "macos-background.png", window-size = "640 360", app-position = "", app-folder-position = "" }
-
-[profile.release]
-strip = true
-lto = true

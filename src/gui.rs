@@ -7,13 +7,15 @@ use iced::{window, Color, Font, Length, Size, Subscription, Task, Theme};
 use iced_term::TerminalView;
 
 static ICON: LazyLock<icon::Icon> = LazyLock::new(|| {
-	use iced::advanced::graphics::image::image_rs::ImageFormat;
-
-	icon::from_file_data(
+	let logo = image::load_from_memory_with_format(
 		include_bytes!("../GModPatchToolLogo.png"),
-		Some(ImageFormat::Png),
+		image::ImageFormat::Png,
 	)
-	.expect("failed to load icon data")
+	.expect("failed to decode icon data")
+	.into_rgba8();
+	let (width, height) = logo.dimensions();
+
+	icon::from_rgba(logo.into_raw(), width, height).expect("failed to load icon data")
 });
 
 #[derive(Debug, Clone)]
@@ -26,8 +28,14 @@ struct App {
 	term: iced_term::Terminal,
 }
 
+impl Default for App {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 impl App {
-	fn new() -> (Self, Task<Event>) {
+	fn new() -> Self {
 		let program = if let Ok(current_exe) = std::env::current_exe() {
 			current_exe.display().to_string()
 		} else if cfg!(target_os = "windows") {
@@ -65,16 +73,17 @@ impl App {
 				bright_white: "#e6e6e6".to_owned(),
 				..Default::default()
 			})),
-			backend: iced_term::settings::BackendSettings { program, args },
+			backend: iced_term::settings::BackendSettings {
+				program,
+				args,
+				..Default::default()
+			},
 		};
 
-		(
-			Self {
-				title: String::from("GModPatchTool - GMod CEF 修补程序"),
-				term: iced_term::Terminal::new(term_id, term_settings).expect("Failed to create the new terminal instance"),
-			},
-			Task::none(),
-		)
+		Self {
+			title: String::from("GModPatchTool - GMod CEF 修补程序"),
+			term: iced_term::Terminal::new(term_id, term_settings).expect("Failed to create the new terminal instance"),
+		}
 	}
 
 	fn title(&self) -> String {
@@ -82,7 +91,7 @@ impl App {
 	}
 
 	fn subscription(&self) -> Subscription<Event> {
-		Subscription::run_with_id(self.term.id, self.term.subscription()).map(Event::Terminal)
+		self.term.subscription().map(Event::Terminal)
 	}
 
 	fn update(&mut self, event: Event) -> Task<Event> {
@@ -90,7 +99,7 @@ impl App {
 			Event::Terminal(iced_term::Event::BackendCall(_, cmd)) => {
 				match self.term.handle(iced_term::Command::ProxyToBackend(cmd)) {
 					iced_term::actions::Action::Shutdown => {
-						return window::get_latest().and_then(window::close)
+						return window::latest().and_then(window::close)
 					}
 					iced_term::actions::Action::ChangeTitle(title) => {
 						self.title = title;
@@ -103,7 +112,7 @@ impl App {
 		}
 	}
 
-	fn view(&self) -> Element<Event, Theme, iced::Renderer> {
+	fn view(&self) -> Element<'_, Event, Theme, iced::Renderer> {
 		// TODO: Scrollbar for Terminal
 		container(TerminalView::show(&self.term).map(Event::Terminal))
 			.width(Length::Fill)
@@ -115,8 +124,9 @@ impl App {
 }
 
 pub fn main() -> iced::Result {
-	iced::application(App::title, App::update, App::view)
+	iced::application(App::default, App::update, App::view)
 		.antialiasing(true)
+		.title(App::title)
 		.window(iced::window::Settings {
 			size: Size {
 				width: 960.0,
@@ -128,5 +138,14 @@ pub fn main() -> iced::Result {
 			..Default::default()
 		})
 		.subscription(App::subscription)
-		.run_with(App::new)
+		.run()
+}
+
+#[cfg(test)]
+mod tests {
+	// The window icon is decoded at startup; a bad PNG would panic there
+	#[test]
+	fn icon_loads() {
+		let _ = &*super::ICON;
+	}
 }

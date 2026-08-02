@@ -3,13 +3,24 @@ const TEXT_SERVER_ROOTS: [&str; 1] = [
 	"https://scs.mf.nekogan.com/raw/"
 ];
 
+
 // Patch files
 const BINARY_SERVER_ROOTS: [&str; 1] = [
 	"https://scs.mf.nekogan.com/media/"
 ];
 
+
 //const GMOD_STEAM_APPID: u64 = 4000;
 const BLANK_FILE_HASH: &str = "null";
+
+// Spinner: a 2x4 Braille well that fills bottom-up with uniform 1-row block drops (3DS download vibe)
+// The full well holds for two ticks before the reset beat; the last frame is indicatif's finished state
+// The reset frame stays escaped because U+2800 (Braille blank) is invisible in source
+const SPINNER_FRAMES: &[&str] = &[
+	"⠄", "⡀", "⡠", "⣀", "⣂", "⣄", "⣔",
+	"⣤", "⣥", "⣦", "⣮", "⣶", "⣶", "\u{2800}", "⣶",
+];
+const SPINNER_TICK: time::Duration = time::Duration::from_millis(100);
 
 use crate::*;
 
@@ -31,8 +42,17 @@ use tokio::time::Instant;
 use tokio::task::JoinSet;
 use qbsdiff::Bspatch;
 use regex::Regex;
+use std::sync::OnceLock;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle, ProgressDrawTarget};
 
 use super::vdf;
+
+// Live progress UI; bars register here so terminal_write can suspend them while printing
+static UI: OnceLock<MultiProgress> = OnceLock::new();
+
+fn spinner_style(template: &str) -> ProgressStyle {
+	ProgressStyle::with_template(template).unwrap().tick_strings(SPINNER_FRAMES).progress_chars("#>-")
+}
 
 #[cfg(windows)]
 use is_elevated::is_elevated;
@@ -62,13 +82,22 @@ struct Args {
 	#[arg(long)]
 	no_sourcescheme: bool,
 
-	/// Skip deleting ChromiumCache/ChromiumCacheMultirun from the GarrysMod directory
+	/// Skip deleting ChromiumCache/ChromiumCacheMultirun/chromium.log from the GarrysMod directory
 	#[arg(long)]
 	skip_clear_chromiumcache: bool,
+
+	/// Skip pre-warming Rosetta translations of patched libraries on Apple Silicon
+	#[cfg(target_os = "macos")]
+	#[arg(long)]
+	skip_rosetta_prewarm: bool,
 
 	/// Force redownload all patch files from scratch and clear the GModPatchTool cache directory on exit
 	#[arg(long)]
 	disable_cache: bool,
+
+	/// Don't use the OS proxy configuration for HTTP requests
+	#[arg(long)]
+	no_system_proxy: bool,
 
 	/// Apply patches even if Garry's Mod is currently running (may cause issues!)
 	#[arg(long)]
@@ -114,9 +143,9 @@ struct SteamUser {
 	//wants_offline_mode: bool,
 	//skip_offline_mode_warning: bool,
 	//allow_auto_login: bool,
-	#[serde(alias = "mostrecent")]
+	#[serde(alias = "mostrecent", default)]
 	most_recent: bool,
-	#[serde(alias = "timestamp")]
+	#[serde(alias = "timestamp", default)]
 	timestamp: u64 // Y2K38
 }
 
@@ -135,6 +164,14 @@ struct SteamLibraryFolder {
 	//time_last_update_verified: u64,
 	//#[serde(alias = "apps")]
 	//apps: SteamLibraryFolderApps
+}
+
+// Steam adds plain number values here too (e.g. contentstatsid), so tolerate anything that isn't a folder
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+enum SteamLibraryFolderEntry {
+	Folder(SteamLibraryFolder),
+	Other(serde::de::IgnoredAny)
 }
 
 //#[derive(Deserialize, Debug)]
@@ -307,22 +344,31 @@ fn terminal_write<W>(writer: fn() -> W, output: &str, newline: bool, color: Opti
 where
 	W: std::io::Write + 'static
 {
-	if color.is_some() && COLOR_LOOKUP.contains_key(color.unwrap()) {
-		write!(writer(), "{}", COLOR_LOOKUP[color.unwrap()]).unwrap();
-	}
+	let write_now = || {
+		if let Some(color) = color && COLOR_LOOKUP.contains_key(color) {
+			write!(writer(), "{}", COLOR_LOOKUP[color]).unwrap();
+		}
 
-	if newline {
-		writeln!(writer(), "{output}").unwrap();
+		if newline {
+			writeln!(writer(), "{output}").unwrap();
+		} else {
+			write!(writer(), "{output}").unwrap();
+		}
+
+		if color.is_some() {
+			write!(writer(), "\x1B[0m").unwrap();
+		}
+	};
+
+	// Suspend any live progress bars so the spinner line isn't clobbered
+	if let Some(ui) = UI.get() {
+		ui.suspend(write_now);
 	} else {
-		write!(writer(), "{output}").unwrap();
-	}
-
-	if color.is_some() {
-		write!(writer(), "\x1B[0m").unwrap();
+		write_now();
 	}
 }
 
-async fn get_http_response<W>(writer: fn() -> W, writer_is_interactive: bool, servers: &[&str], filename: &str, mut server_id: u8, mut try_count: u8) -> Option<Response>
+async fn get_http_response<W>(writer: fn() -> W, writer_is_interactive: bool, servers: &[&str], filename: &str, mut server_id: u8, mut try_count: u8, no_system_proxy: bool) -> Option<Response>
 where
 	W: std::io::Write + 'static
 {
@@ -331,7 +377,14 @@ where
 	while (server_id as usize) < servers.len() {
 		let url = servers[server_id as usize].to_string() + filename;
 
-		let client = reqwest::Client::builder()
+		let mut builder = reqwest::Client::builder();
+
+		if no_system_proxy {
+			builder = builder.no_proxy();
+		}
+
+		let client = builder
+			.https_only(true) // Never follow a redirect down to plaintext HTTP
 			.connect_timeout(std::time::Duration::new(10, 0)) // Initial connection failure
 			.read_timeout(std::time::Duration::new(10, 0)) // Stall detection
 			//.timeout(std::time::Duration::new(size, 0)) // TODO: Total DEADLINE timeout (downloading too slow)
@@ -376,27 +429,51 @@ where
 // Make sure we have response data that *works*
 // Otherwise we'll get "error decoding response body" or something later, where we don't have retry logic
 // TODO: These could probably be DRY'd up...
-async fn get_http_response_bytes<W>(writer: fn() -> W, writer_is_interactive: bool, servers: &[&str], filename: &str) -> Option<Bytes>
+async fn get_http_response_bytes<W>(writer: fn() -> W, writer_is_interactive: bool, bar: &ProgressBar, servers: &[&str], filename: &str, no_system_proxy: bool) -> Option<Bytes>
 where
 	W: std::io::Write + 'static
 {
 	let mut server_id: u8 = 0;
 	let mut try_count: u8 = 0;
 	let mut response_bytes = None;
+	let mut length_counted = false;
 
 	while (server_id as usize) < servers.len() {
-		let response = get_http_response(writer, writer_is_interactive, servers, filename, server_id, try_count).await;
+		let response = get_http_response(writer, writer_is_interactive, servers, filename, server_id, try_count, no_system_proxy).await;
 
-		if let Some(response) = response {
-			let response_bytes_raw = response.bytes().await;
+		if let Some(mut response) = response {
+			// Count this file's size toward the bar total once, even across retries
+			if !length_counted {
+				bar.inc_length(response.content_length().unwrap_or(0));
+				length_counted = true;
+			}
 
-			match response_bytes_raw {
-				// TODO: Check if Bytes is empty as well
-				Ok(response_bytes_raw) => {
-					response_bytes = Some(response_bytes_raw);
+			let mut buf: Vec<u8> = Vec::with_capacity(response.content_length().unwrap_or(0) as usize);
+			let mut stream_error = None;
+
+			// Stream chunks so we can show live download progress
+			// TODO: Stream to disk instead of accumulating whole files in RAM
+			loop {
+				match response.chunk().await {
+					Ok(Some(chunk)) => {
+						bar.inc(chunk.len() as u64);
+						buf.extend_from_slice(&chunk);
+					},
+					Ok(None) => break,
+					Err(error) => {
+						stream_error = Some(error);
+						break;
+					}
+				}
+			}
+
+			match stream_error {
+				// TODO: Check if buf is empty as well
+				None => {
+					response_bytes = Some(Bytes::from(buf));
 					break;
 				},
-				Err(error) => {
+				Some(error) => {
 					terminal_write(writer, format!("\nHTTP 字节错误: {error}\n\n当前重试次数：{try_count}。\n你无需担心，失败三次后会更换 CDN 备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 					response_bytes = None;
 					try_count += 1;
@@ -408,13 +485,16 @@ where
 					}
 				}
 			}
+		} else {
+			// get_http_response only returns None once every server is exhausted, so stop instead of looping forever
+			break;
 		}
 	}
 
 	response_bytes
 }
 
-async fn get_http_response_text<W>(writer: fn() -> W, writer_is_interactive: bool, servers: &[&str], filename: &str) -> Option<String>
+async fn get_http_response_text<W>(writer: fn() -> W, writer_is_interactive: bool, servers: &[&str], filename: &str, no_system_proxy: bool) -> Option<String>
 where
 	W: std::io::Write + 'static
 {
@@ -423,7 +503,7 @@ where
 	let mut response_text = None;
 
 	while (server_id as usize) < servers.len() {
-		let response = get_http_response(writer, writer_is_interactive, servers, filename, server_id, try_count).await;
+		let response = get_http_response(writer, writer_is_interactive, servers, filename, server_id, try_count, no_system_proxy).await;
 
 		if let Some(response) = response {
 			let response_text_raw = response.text().await;
@@ -446,13 +526,16 @@ where
 					}
 				}
 			}
+		} else {
+			// get_http_response only returns None once every server is exhausted, so stop instead of looping forever
+			break;
 		}
 	}
 
 	response_text
 }
 
-async fn get_http_response_json<W, T>(writer: fn() -> W, writer_is_interactive: bool, servers: &[&str], filename: &str) -> Option<T>
+async fn get_http_response_json<W, T>(writer: fn() -> W, writer_is_interactive: bool, servers: &[&str], filename: &str, no_system_proxy: bool) -> Option<T>
 where
 	W: std::io::Write + 'static,
 	T: serde::de::DeserializeOwned
@@ -462,7 +545,7 @@ where
 	let mut response_json = None;
 
 	while (server_id as usize) < servers.len() {
-		let response = get_http_response(writer, writer_is_interactive, servers, filename, server_id, try_count).await;
+		let response = get_http_response(writer, writer_is_interactive, servers, filename, server_id, try_count, no_system_proxy).await;
 
 		if let Some(response) = response {
 			let response_json_raw = response.json::<T>().await;
@@ -485,6 +568,9 @@ where
 					}
 				}
 			}
+		} else {
+			// get_http_response only returns None once every server is exhausted, so stop instead of looping forever
+			break;
 		}
 	}
 
@@ -502,7 +588,7 @@ enum IntegrityStatus {
 
 fn determine_file_integrity_status(gmod_path: PathBuf, filename: &str, hashes: &IndexMap<String, String>) -> Result<IntegrityStatus, String> {
 	let file_parts: Vec<&str> = filename.split("/").collect();
-	let file_path = pathbuf_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_path, &file_parts[..]), false);
+	let file_path = path_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_path, &file_parts[..]), false);
 	let mut file_hash = BLANK_FILE_HASH.to_string();
 
 	if let Ok(file_path) = file_path {
@@ -529,7 +615,7 @@ fn determine_file_integrity_status(gmod_path: PathBuf, filename: &str, hashes: &
 	}
 }
 
-async fn download_file_to_cache<W>(writer: fn() -> W, writer_is_interactive: bool, cache_dir: PathBuf, filename: String, target_hash: String) -> Result<(), ()>
+async fn download_file_to_cache<W>(writer: fn() -> W, writer_is_interactive: bool, bar: ProgressBar, cache_dir: PathBuf, filename: String, target_hash: String, no_system_proxy: bool) -> Result<(), ()>
 where
 	W: std::io::Write + 'static
 {
@@ -541,7 +627,7 @@ where
 	};
 	let file_parts: Vec<&str> = filename_no_zst.split("/").collect();
 	let cache_file_path = extend_pathbuf_and_return(cache_dir, &file_parts[..]);
-	let cache_file_path_result = pathbuf_to_canonical_pathbuf(cache_file_path.clone(), false);
+	let cache_file_path_result = path_to_canonical_pathbuf(&cache_file_path, false);
 
 	terminal_write(writer, format!("\t下载中: {filename} ...").as_str(), true, None);
 
@@ -549,21 +635,20 @@ where
 	if cache_file_path_result.is_ok() {
 		let file_hash_result = get_file_hash(&cache_file_path);
 
-		if let Ok(file_hash) = file_hash_result {
-			if file_hash == target_hash {
+		if let Ok(file_hash) = file_hash_result
+			&& file_hash == target_hash {
 				terminal_write(writer, format!("\t已通过缓存加载: {filename}").as_str(), true, Some("green"));
 				return Ok(());
 			}
-		}
 	}
 
 	// If it's not in the cache, or there's a checksum mismatch with the version in the cache, (re-)download it
-	let response_bytes = get_http_response_bytes(writer, writer_is_interactive, &BINARY_SERVER_ROOTS, filename.as_str()).await;
+	let response_bytes = get_http_response_bytes(writer, writer_is_interactive, &bar, &BINARY_SERVER_ROOTS, filename.as_str(), no_system_proxy).await;
 	if let Some(response_bytes) = response_bytes {
 		// Create directories if needed
 		let mut cache_file_path_dir = cache_file_path.clone();
 		cache_file_path_dir.pop();
-		let cache_file_path_dir_canonical = pathbuf_to_canonical_pathbuf(cache_file_path_dir.clone(), false);
+		let cache_file_path_dir_canonical = path_to_canonical_pathbuf(&cache_file_path_dir, false);
 
 		if cache_file_path_dir_canonical.is_err() {
 			let create_dir_result = tokio::fs::create_dir_all(cache_file_path_dir).await;
@@ -641,12 +726,11 @@ where
 	// If we can't delete it outright, try and truncate it
 	// We could alternatively "patch" it into being empty...but that's a waste of CPU cycles, and if truncating doesn't work, that won't work either
 	if new_integrity_status == IntegrityStatus::NeedDelete {
-		if let Err(delete_error) = std::fs::remove_file(&gmod_file_path) {
-			if let Err(truncate_error) = File::create(&gmod_file_path) {
+		if let Err(delete_error) = std::fs::remove_file(&gmod_file_path)
+			&& let Err(truncate_error) = File::create(&gmod_file_path) {
 				terminal_write(writer, format!("\t修补时出现问题: {filename} | {integrity_status_string}:\n\t删除: {delete_error}\n\t拦截: {truncate_error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 				return new_integrity_status;
 			}
-		}
 
 		terminal_write(writer, format!("\t修补完成: {filename}").as_str(), true, Some("green"));
 		new_integrity_status = IntegrityStatus::Fixed;
@@ -655,9 +739,21 @@ where
 
 	// Copy/overwrite the target gmod file with original copy we have
 	if new_integrity_status == IntegrityStatus::NeedOriginal {
+		let gmod_file_path_dir = gmod_file_path.parent().unwrap().to_path_buf();
+		let gmod_file_path_dir_path = path_to_canonical_pathbuf(&gmod_file_path_dir, false);
+
+		if gmod_file_path_dir_path.is_err() {
+			let create_dir_result = std::fs::create_dir_all(gmod_file_path_dir);
+
+			if let Err(error) = create_dir_result {
+				terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string}: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				return new_integrity_status;
+			}
+		}
+
 		let original_filename = format!("originals/{platform_masked}/{gmod_branch}/{filename}");
 		let original_file_parts: Vec<&str> = original_filename.split("/").collect();
-		let original_cache_file_path = pathbuf_to_canonical_pathbuf(extend_pathbuf_and_return(cache_dir.to_path_buf(), &original_file_parts[..]), false);
+		let original_cache_file_path = path_to_canonical_pathbuf(extend_pathbuf_and_return(cache_dir.to_path_buf(), &original_file_parts[..]), false);
 
 		match original_cache_file_path {
 			Ok(original_cache_file_path) => {
@@ -681,7 +777,7 @@ where
 	// Create/truncate original file (it doesn't exist without patches applied)
 	if new_integrity_status == IntegrityStatus::NeedWipeFix {
 		let gmod_file_path_dir = gmod_file_path.parent().unwrap().to_path_buf();
-		let gmod_file_path_dir_path = pathbuf_to_canonical_pathbuf(gmod_file_path_dir.clone(), false);
+		let gmod_file_path_dir_path = path_to_canonical_pathbuf(&gmod_file_path_dir, false);
 
 		if gmod_file_path_dir_path.is_err() {
 			let create_dir_result = std::fs::create_dir_all(gmod_file_path_dir);
@@ -705,7 +801,7 @@ where
 
 	// Patch the original file into the fixed one!
 	if new_integrity_status == IntegrityStatus::NeedFix {
-		let gmod_file_path = match pathbuf_to_canonical_pathbuf(gmod_file_path, false) {
+		let gmod_file_path = match path_to_canonical_pathbuf(gmod_file_path, false) {
 			Ok(gmod_file_path) => gmod_file_path,
 			Err(error) => {
 				terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 1: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
@@ -716,7 +812,7 @@ where
 		let patch_filename = format!("patches/{platform_masked}/{gmod_branch}/{filename}.bsdiff");
 		let patch_file_parts: Vec<&str> = patch_filename.split("/").collect();
 
-		let patch_file_path = match pathbuf_to_canonical_pathbuf(extend_pathbuf_and_return(cache_dir.to_path_buf(), &patch_file_parts[..]), false) {
+		let patch_file_path = match path_to_canonical_pathbuf(extend_pathbuf_and_return(cache_dir.to_path_buf(), &patch_file_parts[..]), false) {
 			Ok(patch_file_path) => patch_file_path,
 			Err(error) => {
 				terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 2: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
@@ -756,24 +852,18 @@ where
 			return new_integrity_status;
 		}
 
-		let write_result = std::fs::write(&gmod_file_path, &new_gmod_file);
+		// Sanity check the checksum before writing, so a bad patch doesn't clobber the file on disk
+		let file_hash = format!("{}", blake3::hash(&new_gmod_file));
 
-		if let Err(error) = write_result {
-			terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 7: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+		if file_hash != hashes["fixed"] {
+			terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 7: 文件校验失败，可能是文件已损坏").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 			return new_integrity_status;
 		}
 
-		// Sanity check the final checksum
-		let file_hash = match get_file_hash(&gmod_file_path) {
-			Ok(file_hash) => file_hash,
-			Err(error) => {
-				terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 8: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
-				return new_integrity_status;
-			}
-		};
+		let write_result = std::fs::write(&gmod_file_path, &new_gmod_file);
 
-		if file_hash != hashes["fixed"] {
-			terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 9: 文件校验失败，可能是文件已损坏").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+		if let Err(error) = write_result {
+			terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 8: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 			return new_integrity_status;
 		}
 
@@ -790,31 +880,100 @@ unsafe extern "C" {
 	safe fn geteuid() -> u32;
 }
 
+// HACK: Rip out the "WebStorage" section to mitigate stack overflow issues
+// See `thread_stack_size` in main_script
+// See https://github.com/CosmicHorrorDev/vdf-rs/issues/54
+fn strip_localconfig_webstorage(localconfig: String) -> String {
+	let webstorage_start_regex = Regex::new(r"WebStorage.+\s+\{").unwrap();
+	let webstorage_start_match = webstorage_start_regex.find(&localconfig);
+
+	if let Some(webstorage_start_match) = webstorage_start_match {
+		let webstorage_open_bracket = webstorage_start_match.end();
+
+		// Quoted values can contain unbalanced brackets (e.g. Overlay page titles), so only count brackets outside strings
+		let mut next_char_escaped = false;
+		let mut in_string = false;
+		let mut open_bracket_count: usize = 1;
+		let mut webstorage_close_bracket_offset: Option<usize> = None;
+		for (offset, byte) in (0_usize..).zip(localconfig[webstorage_open_bracket..].bytes()) {
+			if next_char_escaped {
+				next_char_escaped = false;
+			} else if byte == b'\\' {
+				next_char_escaped = true;
+			} else if byte == b'"' {
+				in_string = !in_string;
+			} else if !in_string {
+				if byte == b'{' {
+					open_bracket_count += 1;
+				} else if byte == b'}' {
+					open_bracket_count -= 1;
+				}
+
+				if open_bracket_count == 0 {
+					webstorage_close_bracket_offset = Some(offset);
+					break;
+				}
+			}
+		}
+
+		if let Some(webstorage_close_bracket_offset) = webstorage_close_bracket_offset {
+			let webstorage_close_bracket = webstorage_open_bracket + webstorage_close_bracket_offset;
+			return format!("{}{}", &localconfig[..webstorage_open_bracket], &localconfig[webstorage_close_bracket..]);
+		}
+	}
+
+	localconfig
+}
+
 async fn main_script_internal<W>(writer: fn() -> W, writer_is_interactive: bool, args: Args) -> Result<(), AlmightyError>
 where
 	W: std::io::Write + 'static
 {
 	let now = Instant::now();
-	let sys = System::new_all();
+	let mut sys = System::new_all();
+
+	// Set up the live progress UI; hidden when output isn't a terminal so we don't spam control codes
+	let _ = UI.set(MultiProgress::with_draw_target(if writer_is_interactive {
+		ProgressDrawTarget::stdout()
+	} else {
+		ProgressDrawTarget::hidden()
+	}));
 
 	// Figure out where our cache should go based on OS
 	let os_cache_dir = if let Some(dirs_cache_dir) = dirs::cache_dir() { dirs_cache_dir } else { std::env::temp_dir() };
 
-	// Abort if another instance is already running
+	// The cache base (ex. ~/.cache) may not exist on a fresh account; the lockfile create reports any real failure
+	let _ = std::fs::create_dir_all(&os_cache_dir);
+
+	// Take the PID lockfile atomically (O_EXCL); a pre-existing file only counts as running if it points at a live gmodpatchtool
 	let pid_path = extend_pathbuf_and_return(os_cache_dir.clone(), &["gmodpatchtool.pid"]);
-	let running_instance_pid = tokio::fs::read_to_string(&pid_path).await;
-	if let Ok(pid) = running_instance_pid {
-		if let Ok(pid) = pid.parse::<usize>() {
-			if sys.process(sysinfo::Pid::from(pid)).is_some() {
-				return Err(AlmightyError::Generic(format!("已经有一个 GModPatchTool 程序在运行了！进程PID：({pid}).")));
+	let mut lock_attempts = 0;
+	loop {
+		match std::fs::OpenOptions::new().write(true).create_new(true).open(&pid_path) {
+			Ok(mut pid_file) => {
+				use std::io::Write;
+				if let Err(error) = pid_file.write_all(std::process::id().to_string().as_bytes()) {
+					return Err(AlmightyError::Generic(format!("创建 gmodpatchtool.pid 时失败: {error}")));
+				}
+				break;
+			},
+			Err(error) if error.kind() == io::ErrorKind::AlreadyExists && lock_attempts < 2 => {
+				lock_attempts += 1;
+
+				let existing_pid = std::fs::read_to_string(&pid_path).ok().and_then(|pid| pid.trim().parse::<usize>().ok());
+				if let Some(existing_pid) = existing_pid
+					&& let Some(process) = sys.process(sysinfo::Pid::from(existing_pid))
+						&& process.name().to_string_lossy().starts_with("gmodpatchtool") {
+							return Err(AlmightyError::Generic(format!("已经有一个 GModPatchTool 程序在运行了！进程PID：({existing_pid}).")));
+						}
+
+				// Stale lockfile (crashed run or recycled PID); remove it and retry
+				let _ = std::fs::remove_file(&pid_path);
+			},
+			Err(error) => {
+				return Err(AlmightyError::Generic(format!("创建 gmodpatchtool.pid 时失败: {error}")));
 			}
 		}
-	}
-
-	// Create PID lockfile
-	let pid_write_result = tokio::fs::write(&pid_path, std::process::id().to_string()).await;
-	if let Err(error) = pid_write_result {
-		return Err(AlmightyError::Generic(format!("创建 gmodpatchtool.pid 时失败: {error}")));
 	}
 
 	// Get local version
@@ -823,7 +982,7 @@ where
 	// Get remote version
 	terminal_write(writer, "正在获取最新版本信息...\n", true, None);
 
-	let remote_version = get_http_response_text(writer, writer_is_interactive, &TEXT_SERVER_ROOTS, "version.txt").await;
+	let remote_version = get_http_response_text(writer, writer_is_interactive, &TEXT_SERVER_ROOTS, "version.txt", args.no_system_proxy).await;
 
 	if remote_version.is_none() {
 		return Err(AlmightyError::Generic("获取最新版本时出错，请检查你的网络链接".to_string()));
@@ -838,19 +997,19 @@ where
 		terminal_write(writer, format!("🎉恭喜，你正在运行最新版的 GModPatchTool\n[当前版本: {local_version} / 最新版本: {remote_version}]!\n").as_str(), true, if writer_is_interactive { Some("green") } else { None });
 	} else {
 		terminal_write(writer, "⚠️警告: GModPatchTool 有新版本啦！我们推荐你下载最新版本以获取到更多新内容！\nhttps://juice.catkim.xyz/index.php/gmodcefcodecfix/", true, if writer_is_interactive { Some("red") } else { None });
-	}
 
-	let mut secs_to_continue: u8 = 5;
-	while secs_to_continue > 0 {
-		terminal_write(writer, format!("\t将在 {secs_to_continue} 秒后继续...\r").as_str(), false, if writer_is_interactive { Some("yellow") } else { None });
-		writer().flush().unwrap();
-		tokio::time::sleep(time::Duration::from_secs(1)).await;
-		secs_to_continue -= 1;
-	}
+		let mut secs_to_continue: u8 = 5;
+		while secs_to_continue > 0 {
+			terminal_write(writer, format!("\t将在 {secs_to_continue} 秒后继续...\r").as_str(), false, if writer_is_interactive { Some("yellow") } else { None });
+			writer().flush().unwrap();
+			tokio::time::sleep(time::Duration::from_secs(1)).await;
+			secs_to_continue -= 1;
+		}
 
-	// Clear continuing line
-	if writer_is_interactive {
-		terminal_write(writer, "\x1B[0K\n", false, None);
+		// Clear continuing line
+		if writer_is_interactive {
+			terminal_write(writer, "\x1B[0K\n", false, None);
+		}
 	}
 
 	// Warn/Exit if running as root/admin
@@ -863,7 +1022,7 @@ where
 	if root {
 		if args.run_as_root_with_security_risk {
 			terminal_write(writer, "⚠️警告: 你当前正以管理员身份运行 GModPatchTool！这是没有必要的，而且会导致一些不该出现的问题！", true, if writer_is_interactive { Some("red") } else { None });
-			terminal_write(writer, "（镜像版吐槽：Python时代的GCCF怎么没有问题？）", true, None);
+	terminal_write(writer, "（镜像版吐槽：Python时代的GCCF怎么没有问题？）", true, None);
 
 			let mut secs_to_continue: u8 = 10;
 			while secs_to_continue > 0 {
@@ -884,7 +1043,7 @@ where
 	}
 
 	// Abort if GMod is currently running
-	if !args.ignore_gmod_running && sys.processes_by_exact_name("gmod.exe".as_ref()).next().is_some() || sys.processes_by_exact_name("gmod".as_ref()).next().is_some() {
+	if !args.ignore_gmod_running && (sys.processes_by_exact_name("gmod.exe".as_ref()).next().is_some() || sys.processes_by_exact_name("gmod".as_ref()).next().is_some()) {
 		return Err(AlmightyError::Generic("😭 Garry's Mod 已在运行，请先关闭它！".to_string()));
 	}
 
@@ -910,18 +1069,18 @@ where
 		}
 	}
 
-	// TODO: 选择服务器
-
 	// Find Steam
+	// None is the Windows/Linux fallback when no path is found; macOS always reassigns
+	#[allow(unused_assignments)]
 	let mut steam_path = None;
 	if let Some(steam_path_arg) = args.steam_path {
 		// Make sure the path the user is forcing actually exists
-		let steam_path_arg_pathbuf = pathbuf_to_canonical_pathbuf(steam_path_arg.clone(), true);
+		let steam_path_arg_pathbuf = path_to_canonical_pathbuf(&steam_path_arg, true);
 
 		steam_path = match steam_path_arg_pathbuf {
 			Ok(steam_path) => Some(steam_path),
 			Err(error) => {
-				return Err(AlmightyError::Generic(format!("请检查 --steam_path 参数是否指向有效路径:\n\t{error}")));
+				return Err(AlmightyError::Generic(format!("请检查 --steam-path 参数是否指向有效路径:\n\t{error}")));
 			}
 		}
 	} else {
@@ -930,7 +1089,7 @@ where
 		{
 			if let Ok(steam_reg_key) = windows_registry::CURRENT_USER.open("Software\\Valve\\Steam") {
 				if let Ok(steam_reg_path) = steam_reg_key.get_string("SteamPath") {
-					steam_path = string_to_canonical_pathbuf(steam_reg_path);
+					steam_path = path_to_canonical_pathbuf(steam_reg_path, true).ok();
 				}
 			}
 		}
@@ -941,7 +1100,7 @@ where
 			// $HOME/Library/Application Support/Steam
 			let mut steam_data_path = dirs::data_dir().unwrap();
 			steam_data_path.push("Steam");
-			steam_path = pathbuf_to_canonical_pathbuf(steam_data_path, true).ok();
+			steam_path = path_to_canonical_pathbuf(steam_data_path, true).ok();
 		}
 
 		// Anything else (we assume Linux)
@@ -962,7 +1121,7 @@ where
 			let mut valid_steam_paths = vec![];
 
 			for pathbuf in possible_steam_paths {
-				if let Ok(pathbuf) = pathbuf_to_canonical_pathbuf(pathbuf, true) {
+				if let Ok(pathbuf) = path_to_canonical_pathbuf(pathbuf, true) {
 					if !valid_steam_paths.contains(&pathbuf) {
 						valid_steam_paths.push(pathbuf);
 					}
@@ -971,7 +1130,7 @@ where
 
 			// $XDG_DATA_HOME/Steam
 			if let Some(steam_xdg_path) = dirs::data_dir() {
-				if let Ok(steam_xdg_pathbuf) = pathbuf_to_canonical_pathbuf(extend_pathbuf_and_return(steam_xdg_path, &["Steam"]), true) {
+				if let Ok(steam_xdg_pathbuf) = path_to_canonical_pathbuf(extend_pathbuf_and_return(steam_xdg_path, &["Steam"]), true) {
 					if !valid_steam_paths.contains(&steam_xdg_pathbuf) {
 						valid_steam_paths.push(steam_xdg_pathbuf);
 					}
@@ -1010,7 +1169,7 @@ where
 	}
 
 	if steam_path.is_none() {
-		return Err(AlmightyError::Generic("❌错误：未找到 Steam 安装路径，如果你坚信你装了，尽管可能手段不太光明，你可以通过添加参数 --steam_path 来指定 Steam 的安装路径".to_string()));
+		return Err(AlmightyError::Generic("❌错误：未找到 Steam 安装路径，如果你坚信你装了，尽管可能手段不太光明，你可以通过添加参数 --steam-path 来指定 Steam 的安装路径".to_string()));
 	}
 
 	let steam_path = steam_path.unwrap();
@@ -1020,13 +1179,14 @@ where
 
 	// Get most recent Steam User, which is probably the one they're using/want
 	let steam_loginusers_path = extend_pathbuf_and_return(steam_path.clone(), &["config", "loginusers.vdf"]);
-	let steam_loginusers_str = tokio::fs::read_to_string(steam_loginusers_path).await;
+	let steam_loginusers_bytes = tokio::fs::read(steam_loginusers_path).await;
 
-	if steam_loginusers_str.is_err() {
+	if steam_loginusers_bytes.is_err() {
 		return Err(AlmightyError::Generic("❌loginusers.vdf 去异世界旅游了！也许它从来就没有出生过？你可以通过尝试重新登录 Steam 来召回它，或许你也可以摆个法阵来召唤。".to_string()));
 	}
 
-	let steam_loginusers_str = steam_loginusers_str.unwrap();
+	// loginusers.vdf can hold invalid UTF-8 (truncated persona names), so decode lossily
+	let steam_loginusers_str = String::from_utf8_lossy(&steam_loginusers_bytes.unwrap()).into_owned();
 	let steam_loginusers = vdf::from_str(steam_loginusers_str.as_str());
 
 	if let Err(error) = steam_loginusers {
@@ -1034,12 +1194,19 @@ where
 	}
 
 	let mut steam_user: HashMap<&str, String> = HashMap::new();
+	let mut steam_user_is_most_recent = false;
 	let steam_loginusers: HashMap<&str, SteamUser> = steam_loginusers.unwrap();
 	for (other_steam_id_64, other_steam_user) in steam_loginusers {
 		let mostrecent = other_steam_user.most_recent;
 		let timestamp = other_steam_user.timestamp;
 
-		if !steam_user.contains_key("Timestamp") || mostrecent || (timestamp > steam_user.get("Timestamp").unwrap().parse::<u64>().unwrap()) {
+		// MostRecent wins outright; otherwise the newest timestamp wins, but never over a MostRecent pick
+		let take = !steam_user.contains_key("Timestamp")
+			|| mostrecent
+			|| (!steam_user_is_most_recent && timestamp > steam_user.get("Timestamp").unwrap().parse::<u64>().unwrap());
+
+		if take {
+			steam_user_is_most_recent = mostrecent;
 			steam_user.insert("SteamID64", other_steam_id_64.to_string());
 			steam_user.insert("Timestamp", timestamp.to_string());
 			steam_user.insert("AccountName", other_steam_user.account_name);
@@ -1051,7 +1218,10 @@ where
 		return Err(AlmightyError::Generic("❌我的高达驾驶员呢？你有登录过 Steam 吗？".to_string()));
 	}
 
-	let steam_id = SteamId::new(steam_user.get("SteamID64").unwrap().parse::<u64>().unwrap()).unwrap();
+	let steam_id = steam_user.get("SteamID64").unwrap().parse::<u64>().ok().and_then(|steam_id_64| SteamId::new(steam_id_64).ok());
+	let Some(steam_id) = steam_id else {
+		return Err(AlmightyError::Generic("❌loginusers.vdf 发生了血肉畸变！我们不认识它了！".to_string()));
+	};
 
 	terminal_write(writer, format!("Steam User: {} ({} / {})\n", steam_user.get("PersonaName").unwrap(), steam_user.get("SteamID64").unwrap(), steam_id.steam3id()).as_str(), true, None);
 
@@ -1086,12 +1256,18 @@ where
 	let mut gmod_steam_library_path = None;
 	let mut gmod_manifest_str = None;
 
-	let steam_libraryfolders: HashMap<&str, SteamLibraryFolder> = steam_libraryfolders.unwrap();
+	// IndexMap keeps the VDF's order so a stale appmanifest in a later library can't randomly win over the real install
+	let steam_libraryfolders: IndexMap<&str, SteamLibraryFolderEntry> = steam_libraryfolders.unwrap();
 	for (_, steam_library) in steam_libraryfolders {
-		// Get potential Steam Library
-		let new_gmod_steam_library_path = string_to_canonical_pathbuf(steam_library.path);
+		// Skip non-folder entries (number values like contentstatsid)
+		let SteamLibraryFolderEntry::Folder(steam_library) = steam_library else {
+			continue;
+		};
 
-		if let Some(new_gmod_steam_library_path) = new_gmod_steam_library_path {
+		// Get potential Steam Library
+		let new_gmod_steam_library_path = path_to_canonical_pathbuf(steam_library.path, true);
+
+		if let Ok(new_gmod_steam_library_path) = new_gmod_steam_library_path {
 			// Get GMod manifest
 			let mut new_gmod_manifest_path = extend_pathbuf_and_return(new_gmod_steam_library_path.to_path_buf(), &["steamapps", "appmanifest_4000.acf"]);
 			let mut new_gmod_manifest_str = tokio::fs::read_to_string(new_gmod_manifest_path).await;
@@ -1148,18 +1324,18 @@ where
 	// TODO: Change branch to x86-64 if the current branch isn't in the manifest
 	let gmod_mountedconfig = gmod_manifest.mounted_config;
 	let gmod_branch = gmod_mountedconfig.beta_key;
-	let gmod_branch = if let Some(gmod_branch) = gmod_branch { gmod_branch } else { "public".to_string() };
+	let gmod_branch = match gmod_branch { Some(gmod_branch) if !gmod_branch.is_empty() => gmod_branch, _ => "public".to_string() };
 
 	terminal_write(writer, format!("GMod 测试渠道: {gmod_branch}\n").as_str(), true, None);
 
 	// Get GMod path
 	// TODO: What about `steamapps/<username>/GarrysMod`? Is that still a thing, or did SteamPipe kill/migrate it completely?
 	let gmod_path_config = gmod_manifest.install_dir;
-	let mut gmod_path = pathbuf_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_steam_library_path.clone(), &["steamapps", "common", &gmod_path_config]), true);
+	let mut gmod_path = path_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_steam_library_path.clone(), &["steamapps", "common", &gmod_path_config]), true);
 
 	// Try SteamApps with capitalization
 	if gmod_path.is_err() {
-		gmod_path = pathbuf_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_steam_library_path.clone(), &["SteamApps", "common", &gmod_path_config]), true);
+		gmod_path = path_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_steam_library_path.clone(), &["SteamApps", "common", &gmod_path_config]), true);
 	}
 
 	if gmod_path.is_err() {
@@ -1174,13 +1350,11 @@ where
 	// Abort if they're running as root AND the GMod directory isn't owned by root
 	// Will hopefully prevent broken installs/updating
 	#[cfg(unix)]
-	if root {
-		if let Ok(gmod_dir_meta) = tokio::fs::metadata(&gmod_path).await {
-			if gmod_dir_meta.uid() != 0 {
+	if root
+		&& let Ok(gmod_dir_meta) = tokio::fs::metadata(&gmod_path).await
+			&& gmod_dir_meta.uid() != 0 {
 				return Err(AlmightyError::Generic("恭喜你，你正以 root 身份运行 GModPatchTool！而你成功触发了先前的警告！ Garry's Mod 的安装目录的所有者并不属于 root，请重新分配目录权限，或使用其他账户运行该程序！\n程序即将退出...".to_string()));
 			}
-		}
-	}
 
 	// Determine target platform
 	// Get GMod CompatTool config (Steam Linux Runtime, Proton, etc) on Linux
@@ -1231,47 +1405,14 @@ where
 	// Warn if -nochromium is in launch options
 	// Some GMod "menu error fix" guides include it + gmod-lua-menu
 	let steam_user_localconfig_path = extend_pathbuf_and_return(steam_path.clone(), &["userdata", steam_id.account_id().into_u32().to_string().as_str(), "config", "localconfig.vdf"]);
-	let steam_user_localconfig_str = tokio::fs::read_to_string(steam_user_localconfig_path).await;
+	let steam_user_localconfig_bytes = tokio::fs::read(steam_user_localconfig_path).await;
 
-	if steam_user_localconfig_str.is_err() {
-		return Err(AlmightyError::Generic("❌localconfig.vdf 去异世界旅游了！也许它从来就没有出生过？你可以通过尝试重新登录 Steam 来召回它，或许你也可以摆个法阵来召唤。".to_string()));
+	if let Err(error) = steam_user_localconfig_bytes {
+		return Err(AlmightyError::Generic(format!("❌localconfig.vdf 去异世界旅游了！也许它从来就没有出生过？你可以通过尝试重新登录 Steam 来召回它，或许你也可以摆个法阵来召唤。\n\t{error}")));
 	}
 
-	// HACK: Rip out the "WebStorage" section to mitigate stack overflow issues
-	// See `thread_stack_size` below
-	// See https://github.com/CosmicHorrorDev/vdf-rs/issues/54
-	let mut steam_user_localconfig_str = steam_user_localconfig_str.unwrap();
-	let webstorage_start_regex = Regex::new(r"WebStorage.+\s+\{").unwrap();
-	let webstorage_start_match = webstorage_start_regex.find(&steam_user_localconfig_str);
-
-	if let Some(webstorage_start_match) = webstorage_start_match {
-		let webstorage_open_bracket = webstorage_start_match.end();
-
-		let mut next_char_escaped = false;
-		let mut open_bracket_count: usize = 1;
-		let mut webstorage_close_bracket_offset: Option<usize> = None;
-		for (offset, byte) in (0_usize..).zip(steam_user_localconfig_str[webstorage_open_bracket..].bytes()) {
-			if !next_char_escaped {
-				if byte == b'{' {
-					open_bracket_count += 1;
-				} else if byte == b'}' {
-					open_bracket_count -= 1;
-				}
-
-				if open_bracket_count == 0 {
-					webstorage_close_bracket_offset = Some(offset);
-					break;
-				}
-			}
-
-			next_char_escaped = byte == b'\\';
-		}
-
-		if let Some(webstorage_close_bracket_offset) = webstorage_close_bracket_offset {
-			let webstorage_close_bracket = webstorage_open_bracket + webstorage_close_bracket_offset;
-			steam_user_localconfig_str = format!("{}{}", &steam_user_localconfig_str[..webstorage_open_bracket], &steam_user_localconfig_str[webstorage_close_bracket..]);
-		}
-	}
+	// localconfig.vdf can hold invalid UTF-8 (Steam truncates friend persona names mid-codepoint), so decode lossily
+	let steam_user_localconfig_str = strip_localconfig_webstorage(String::from_utf8_lossy(&steam_user_localconfig_bytes.unwrap()).into_owned());
 
 	let steam_user_localconfig = vdf::from_str(steam_user_localconfig_str.as_str());
 
@@ -1283,8 +1424,8 @@ where
 	let steam_user_localconfig_gmod = steam_user_localconfig.software.valve.steam.apps.gmod;
 
 	if let Some(steam_user_localconfig_gmod) = steam_user_localconfig_gmod {
-		if let Some(steam_user_localconfig_gmod_launchopts) = &steam_user_localconfig_gmod.launch_options {
-			if steam_user_localconfig_gmod_launchopts.contains("-nochromium") {
+		if let Some(steam_user_localconfig_gmod_launchopts) = &steam_user_localconfig_gmod.launch_options
+			&& steam_user_localconfig_gmod_launchopts.contains("-nochromium") {
 				terminal_write(writer, "⚠️警告: 侦测到 GMod 启动项 -nochromium！CEF 和它水火不容！\n\t请前往 Steam > Garry's Mod > 属性 > 通用 中移除它！\n\t此外，如果你安装了 gmod-lua-menu，请将其卸载", true, if writer_is_interactive { Some("yellow") } else { None });
 
 				let mut secs_to_continue: u8 = 5;
@@ -1300,7 +1441,6 @@ where
 					terminal_write(writer, "\x1B[0K\n", false, None);
 				}
 			}
-		}
 	} else {
 		return Err(AlmightyError::Generic("Couldn't find Garry's Mod in user localconfig.vdf. Is Garry's Mod installed?".to_string()));
 	}
@@ -1308,7 +1448,7 @@ where
 	// Get remote manifest
 	terminal_write(writer, "获取远程文件中...", true, None);
 
-	let remote_manifest = get_http_response_json::<_, Manifest>(writer, writer_is_interactive, &TEXT_SERVER_ROOTS, "manifest.json").await;
+	let remote_manifest = get_http_response_json::<_, Manifest>(writer, writer_is_interactive, &TEXT_SERVER_ROOTS, "manifest.json", args.no_system_proxy).await;
 
 	if remote_manifest.is_none() {
 		terminal_write(writer, "", true, None); // Newline
@@ -1331,6 +1471,14 @@ where
 
 	let platform_branch_files = platform_branch_files.unwrap();
 
+	// Reject manifest paths that could escape the GMod directory or inject terminal escapes, in case the manifest is ever compromised
+	for filename in platform_branch_files.keys() {
+		let path_is_safe = std::path::Path::new(filename).components().all(|component| matches!(component, std::path::Component::Normal(_)));
+		if !path_is_safe || filename.chars().any(|character| character.is_control()) {
+			return Err(AlmightyError::Generic(format!("文件列表包含不安全路径: {filename:?}")));
+		}
+	}
+
 	// Determine file integrity status
 	terminal_write(writer, "正在确定文件完整性状态...", true, None);
 
@@ -1347,21 +1495,8 @@ where
 	let integrity_results: Vec<(&String, Result<IntegrityStatus, String>, &IndexMap<String, String>)> = platform_branch_files.par_iter()
 	.map(|(filename, hashes)| {
 		let integrity_result;
-		let mut sourcescheme_select = String::new();
-
-		// if sourcescheme_select != "" && !args.no_sourcescheme && filename.ends_with(".res") {
-		// 	terminal_write(writer,"⚠️警告：最新版的 GModPatchTool 会修改 GMod 的 VGUI 组件，并且会修改控制台的文本样式，如果你不喜欢可以禁用该功能！", true, Some("red"));
-		// 	terminal_write(writer,"是否要安装 SourceScheme？(y/n) ", true, None);
-		// 	io::stdin()
-		// 		.read_line(&mut sourcescheme_select)
-		// 		.expect("您的输入有误！");
-		// }
-
 		if args.no_sourcescheme && filename.ends_with(".res") {
 			terminal_write(writer, format!("\t{filename}: 因 --no-sourcescheme 而被跳过").as_str(), true, if writer_is_interactive { Some("green") } else { None });
-			integrity_result = Ok(IntegrityStatus::Fixed);
-		} else if sourcescheme_select == "y" && filename.ends_with(".res") {
-			terminal_write(writer, format!("\t{filename}: 因 用户选择 而被跳过").as_str(), true, if writer_is_interactive { Some("green") } else { None });
 			integrity_result = Ok(IntegrityStatus::Fixed);
 		} else {
 			integrity_result = determine_file_integrity_status(gmod_path.clone(), filename, hashes);
@@ -1401,10 +1536,10 @@ where
 	if pending_files_len > 0 {
 		// Delete old GModCEFCodecFix cache directory
 		#[cfg(windows)]
-		let old_cache_dir = pathbuf_to_canonical_pathbuf(extend_pathbuf_and_return(os_cache_dir.clone(), &["Temp", "GModCEFCodecFix"]), false);
+		let old_cache_dir = path_to_canonical_pathbuf(extend_pathbuf_and_return(os_cache_dir.clone(), &["Temp", "GModCEFCodecFix"]), false);
 
 		#[cfg(not(windows))]
-		let old_cache_dir = pathbuf_to_canonical_pathbuf(extend_pathbuf_and_return(os_cache_dir.clone(), &["GModCEFCodecFix"]), false);
+		let old_cache_dir = path_to_canonical_pathbuf(extend_pathbuf_and_return(os_cache_dir.clone(), &["GModCEFCodecFix"]), false);
 
 		if let Ok(old_cache_dir) = old_cache_dir {
 			let old_cache_dir_result = tokio::fs::remove_dir_all(old_cache_dir).await;
@@ -1422,7 +1557,7 @@ where
 		// Create new GModPatchTool cache directory if it doesn't exist
 		let cache_path = extend_pathbuf_and_return(os_cache_dir, &["GModPatchTool"]);
 		let mut cache_path_str = cache_path.to_string_lossy();
-		let mut cache_dir = pathbuf_to_canonical_pathbuf(cache_path.clone(), false);
+		let mut cache_dir = path_to_canonical_pathbuf(&cache_path, false);
 
 		// ...but make sure it doesn't exist (and clear it) if disable_cache is set
 		if args.disable_cache {
@@ -1439,14 +1574,14 @@ where
 				}
 			}
 
-			cache_dir = pathbuf_to_canonical_pathbuf(cache_path.clone(), false);
+			cache_dir = path_to_canonical_pathbuf(&cache_path, false);
 		}
 
 		if cache_dir.is_err() {
-			let create_result = tokio::fs::create_dir(cache_path.clone()).await;
+			let create_result = tokio::fs::create_dir_all(cache_path.clone()).await;
 
 			if create_result.is_ok() {
-				cache_dir = pathbuf_to_canonical_pathbuf(cache_path.clone(), false);
+				cache_dir = path_to_canonical_pathbuf(&cache_path, false);
 			}
 		}
 
@@ -1463,27 +1598,53 @@ where
 		// Download what we need
 		terminal_write(writer, "正在下载文件...", true, None);
 
+		// Length starts at 1 (0 renders as a full bar) and grows as each download's Content-Length arrives
+		let download_bar = UI.get().unwrap().add(ProgressBar::new(1));
+		download_bar.set_style(spinner_style("{spinner} 正在下载 {msg} 个文件 [{bar:25}] {percent}% \u{B7} {bytes}/{total_bytes} ({binary_bytes_per_sec})"));
+		download_bar.enable_steady_tick(SPINNER_TICK);
+
 		let mut download_futures = JoinSet::new();
 		for (filename, integrity_status, hashes) in &pending_files {
 			// Need Original
 			if *integrity_status == IntegrityStatus::NeedOriginal {
-				download_futures.spawn(download_file_to_cache(writer, writer_is_interactive, cache_dir.clone(), format!("originals/{platform_masked}/{gmod_branch}/{filename}.zst"), hashes["original"].clone()));
+				download_futures.spawn(download_file_to_cache(writer, writer_is_interactive, download_bar.clone(), cache_dir.clone(), format!("originals/{platform_masked}/{gmod_branch}/{filename}.zst"), hashes["original"].clone(), args.no_system_proxy));
 			}
 
 			// Need Fix (we filtered out IntegrityStatus::Fixed above, but we still need IntegrityStatus::NeedDelete for later)
 			if *integrity_status != IntegrityStatus::NeedDelete {
-				download_futures.spawn(download_file_to_cache(writer, writer_is_interactive, cache_dir.clone(), format!("patches/{platform_masked}/{gmod_branch}/{filename}.bsdiff"), hashes["patch"].clone()));
+				download_futures.spawn(download_file_to_cache(writer, writer_is_interactive, download_bar.clone(), cache_dir.clone(), format!("patches/{platform_masked}/{gmod_branch}/{filename}.bsdiff"), hashes["patch"].clone(), args.no_system_proxy));
 			}
 		}
 
+		let download_files_total = download_futures.len();
+		let mut download_files_done: usize = 0;
+		download_bar.set_message(format!("0/{download_files_total}"));
+
 		while let Some(download_result) = download_futures.join_next().await {
-			if download_result.is_err() {
+			// The outer Result is task failure (panic/abort), the inner is download failure
+			if !matches!(download_result, Ok(Ok(()))) {
+				download_bar.finish_and_clear();
 				return Err(AlmightyError::Generic("下载一个或多个补丁文件失败！".to_string()));
 			}
+
+			download_files_done += 1;
+			download_bar.set_message(format!("{download_files_done}/{download_files_total}"));
+		}
+
+		download_bar.finish_and_clear();
+
+		// Re-check that GMod wasn't launched during the download phase, since we're about to write to its files
+		sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+		if !args.ignore_gmod_running && (sys.processes_by_exact_name("gmod.exe".as_ref()).next().is_some() || sys.processes_by_exact_name("gmod".as_ref()).next().is_some()) {
+			return Err(AlmightyError::Generic("😭 Garry's Mod 已在运行，请先关闭它！".to_string()));
 		}
 
 		// Patch the files
 		terminal_write(writer, format!("\nPatching {pending_files_len} file(s)...").as_str(), true, None);
+
+		let patch_bar = UI.get().unwrap().add(ProgressBar::new(pending_files_len as u64));
+		patch_bar.set_style(spinner_style("{spinner} 正在修补 {pos}/{len} 个文件 [{bar:25}] {percent}%"));
+		patch_bar.enable_steady_tick(SPINNER_TICK);
 
 		// TODO: Early exit if any patches fail
 		let patch_results: Vec<(&String, IntegrityStatus)> = pending_files.par_iter()
@@ -1501,8 +1662,12 @@ where
 				hashes
 			);
 
+			patch_bar.inc(1);
+
 			(*filename, new_integrity_status)
 		}).collect();
+
+		patch_bar.finish_and_clear();
 
 		for (_, integrity_status) in patch_results {
 			if integrity_status != IntegrityStatus::Fixed {
@@ -1534,13 +1699,15 @@ where
 	{
 		terminal_write(writer, "\n处理文件权限中...", true, None);
 
+		let mut exec_bit_failed = false;
+
 		for (filename, fileinfo) in platform_branch_files {
 			let executable = fileinfo.get("executable");
 
-			if let Some(executable) = executable {
-				if executable == "true" {
+			if let Some(executable) = executable
+				&& executable == "true" {
 					let gmod_file_parts: Vec<&str> = filename.split("/").collect();
-					let gmod_file_path = pathbuf_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_path.clone(), &gmod_file_parts[..]), true);
+					let gmod_file_path = path_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_path.clone(), &gmod_file_parts[..]), true);
 
 					if let Ok(gmod_file_path) = gmod_file_path {
 						let metadata = tokio::fs::metadata(&gmod_file_path).await;
@@ -1549,6 +1716,7 @@ where
 							Ok(metadata) => {
 								// Ensure the executable bit is present and apply it to the file
 								let mut perms = metadata.permissions();
+								let already_executable = perms.mode() & 0o111 != 0;
 								perms.set_mode(perms.mode() | 0o111);
 								let perms_result: Result<(), io::Error> = tokio::fs::set_permissions(&gmod_file_path, perms).await;
 
@@ -1558,25 +1726,96 @@ where
 									},
 									Err(error) => {
 										terminal_write(writer, format!("\t应用权限失败：{filename} | {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
-										// TODO: Fatal?
+
+										// Re-applying perms can fail on already-fine files we don't own; only a missing bit is fatal
+										if !already_executable {
+											exec_bit_failed = true;
+										}
 									}
 								}
 							},
 							Err(error) => {
 								terminal_write(writer, format!("\t应用权限失败：{filename} | {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
-								// TODO: Fatal?
 							}
 						}
 					}
 				}
-			}
+		}
+
+		if exec_bit_failed {
+			return Err(AlmightyError::Generic("一个或多个文件无法被设置为可执行！".to_string()));
 		}
 	}
 
-	// Delete ChromiumCache/ChromiumCacheMultirun
+	// Rosetta has to re-translate everything we patch before it can run again, which takes a LONG time for CEF on slower Apple Silicon Macs (and makes the first launch look like it's hanging)
+	// Prewarm Rosetta's translation cache now by loading the patched libraries in an x86-64 subprocess, so we can get through it here instead of on first launch
+	#[cfg(target_os = "macos")]
+	if !args.skip_rosetta_prewarm {
+		// Rosetta only exists on Apple Silicon, so this also skips Intel Macs
+		if std::path::Path::new("/Library/Apple/usr/share/rosetta/rosetta").is_file() {
+			let mut prewarm_paths = Vec::new();
+			for (filename, fileinfo) in platform_branch_files {
+				let executable = fileinfo.get("executable");
+
+				// Only libraries can be dlopen'd, but the executables are tiny compared to them anyway
+				if let Some(executable) = executable
+					&& executable == "true"
+					&& (filename.ends_with(".dylib") || filename.ends_with("Chromium Embedded Framework")) {
+						let gmod_file_parts: Vec<&str> = filename.split("/").collect();
+						let gmod_file_path = path_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_path.clone(), &gmod_file_parts[..]), true);
+
+						if let Ok(gmod_file_path) = gmod_file_path {
+							prewarm_paths.push(gmod_file_path);
+						}
+					}
+			}
+
+			// The CEF Framework is by far the biggest, so translate it first in case we hit the timeout
+			prewarm_paths.sort_by_key(|prewarm_path| !prewarm_path.ends_with("Chromium Embedded Framework"));
+
+			if !prewarm_paths.is_empty() {
+				terminal_write(writer, "\n正在预热 Rosetta 翻译缓存（在较慢的 Mac 上可能需要几分钟）...", true, None);
+
+				match std::env::current_exe() {
+					Ok(current_exe) => {
+						let mut prewarm_command = tokio::process::Command::new("/usr/bin/arch");
+						prewarm_command.arg("-x86_64")
+							.arg(current_exe)
+							.arg("--rosetta-prewarm")
+							.args(&prewarm_paths)
+							.kill_on_drop(true);
+
+						let prewarm_result = tokio::time::timeout(time::Duration::from_secs(300), prewarm_command.status()).await;
+
+						match prewarm_result {
+							Ok(Ok(prewarm_status)) if prewarm_status.success() => {
+								terminal_write(writer, "完成!", true, None);
+							},
+							Ok(Ok(_)) => {
+								terminal_write(writer, "\t部分库预热失败！首次启动时 macOS 翻译新文件可能会变慢。", true, if writer_is_interactive { Some("yellow") } else { None });
+							},
+							Ok(Err(error)) => {
+								terminal_write(writer, format!("\t预热失败: {error}\n\t首次启动时 macOS 翻译新文件可能会变慢。").as_str(), true, if writer_is_interactive { Some("yellow") } else { None });
+							},
+							Err(_) => {
+								terminal_write(writer, "\t预热超时！首次启动时 macOS 翻译新文件可能会变慢。", true, if writer_is_interactive { Some("yellow") } else { None });
+							}
+						}
+					},
+					Err(error) => {
+						terminal_write(writer, format!("\t预热失败: {error}").as_str(), true, if writer_is_interactive { Some("yellow") } else { None });
+					}
+				}
+			}
+		} else if std::env::consts::ARCH == "aarch64" {
+			terminal_write(writer, "\n未安装 Rosetta 2！Garry's Mod 在 Apple Silicon 上运行需要它：\n\tsoftwareupdate --install-rosetta --agree-to-license", true, if writer_is_interactive { Some("yellow") } else { None });
+		}
+	}
+
+	// Delete ChromiumCache/ChromiumCacheMultirun/chromium.log
 	// Solves issues with being corrupt/stuck lockfiles, and GMod MUST NOT be running for this tool to run, so it probably solves more issues than it could create
 	if !args.skip_clear_chromiumcache {
-		let gmod_chromiumcache_path = pathbuf_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_path.clone(), &["ChromiumCache"]), false);
+		let gmod_chromiumcache_path = path_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_path.clone(), &["ChromiumCache"]), false);
 		if let Ok(gmod_chromiumcache_path) = gmod_chromiumcache_path {
 			terminal_write(writer, "\n正在清理 ChromiumCache...", true, None);
 			if let Err(error) = tokio::fs::remove_dir_all(gmod_chromiumcache_path).await {
@@ -1586,11 +1825,21 @@ where
 			}
 		}
 
-		let gmod_chromiumcachemultirun_path = pathbuf_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_path.clone(), &["ChromiumCacheMultirun"]), false);
+		let gmod_chromiumcachemultirun_path = path_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_path.clone(), &["ChromiumCacheMultirun"]), false);
 		if let Ok(gmod_chromiumcachemultirun_path) = gmod_chromiumcachemultirun_path {
 			terminal_write(writer, "\n正在清理 ChromiumCacheMultirun...", true, None);
 			if let Err(error) = tokio::fs::remove_dir_all(gmod_chromiumcachemultirun_path).await {
 				terminal_write(writer, format!("\t错误: {error}\n\t你可能需要手动从 GarrysMod 目录中删除 ChromiumCacheMultirun").as_str(), true, if writer_is_interactive { Some("yellow") } else { None });
+			} else {
+				terminal_write(writer, "完成!", true, None);
+			}
+		}
+
+		let gmod_chromiumlog_path = path_to_canonical_pathbuf(extend_pathbuf_and_return(gmod_path.clone(), &["chromium.log"]), false);
+		if let Ok(gmod_chromiumlog_path) = gmod_chromiumlog_path {
+			terminal_write(writer, "\n正在删除 chromium.log...", true, None);
+			if let Err(error) = tokio::fs::remove_file(gmod_chromiumlog_path).await {
+				terminal_write(writer, format!("\t错误: {error}\n\t你可能需要手动从 GarrysMod 目录中删除 chromium.log").as_str(), true, if writer_is_interactive { Some("yellow") } else { None });
 			} else {
 				terminal_write(writer, "完成!", true, None);
 			}
@@ -1606,7 +1855,7 @@ where
 	if args.launch_gmod {
 		terminal_write(writer, "正在启动 Garry's Mod...", true, if writer_is_interactive { Some("green") } else { None });
 
-		let open_result = open::that("steam://rungameid/4000");
+		let open_result = open::that_detached("steam://rungameid/4000");
 		if let Err(error) = open_result {
 			terminal_write(writer, format!("\t失败: {error}").as_str(), true, if writer_is_interactive { Some("yellow") } else { None });
 		}
@@ -1614,7 +1863,9 @@ where
 		terminal_write(writer, "你现在可以通过 Steam 启动 GMod 了", true, if writer_is_interactive { Some("green") } else { None });
 	}
 
-	terminal_write(writer, "\n💖 你是否认为该工具很好用？请在下面的链接支持我们！", true, if writer_is_interactive { Some("magenta") } else { None });
+	// Keep the emoji outside the colored span: bold color codes break color emoji in the GUI terminal
+	terminal_write(writer, "\n💖 ", false, None);
+	terminal_write(writer, "你是否认为该工具很好用？请在下面的链接支持我们！", true, if writer_is_interactive { Some("magenta") } else { None });
 	terminal_write(writer, "\t软件原作者 > https://solsticegamestudios.com/donate/", true, None);
 	terminal_write(writer, "\n\n软件的运营需要成本，如果你有能力的话请帮帮我们！", true, if writer_is_interactive { Some("magenta") } else { None });
 	terminal_write(writer, "\t赞助链接 > https://blog.nekogan.com/1779011106565", true, None);
@@ -1623,21 +1874,65 @@ where
 	Ok(())
 }
 
+// Prewarm child mode: dlopen each library given on the command line, which makes Rosetta translate it into its cache before returning
+// dlopen can only load x86-64 libraries from an x86-64 process, so the prewarm step above runs our own x86-64 slice via /usr/bin/arch
+// This MUST run before everything else in main() so the child doesn't continue into the GUI/lockfile/arg stuff
+#[cfg(target_os = "macos")]
+fn rosetta_prewarm_child() {
+	let mut args = std::env::args_os();
+
+	if args.nth(1).as_deref() != Some(std::ffi::OsStr::new("--rosetta-prewarm")) {
+		return;
+	}
+
+	unsafe extern "C" {
+		fn dlopen(filename: *const std::ffi::c_char, flags: std::ffi::c_int) -> *mut std::ffi::c_void;
+		fn dlerror() -> *const std::ffi::c_char;
+	}
+	const RTLD_NOW: std::ffi::c_int = 0x2;
+
+	let mut prewarm_failed = false;
+
+	for path in args {
+		let path_cstring = std::ffi::CString::new(path.as_encoded_bytes());
+
+		match path_cstring {
+			Ok(path_cstring) => {
+				// Loading the library is all it takes; we don't need to do anything with it
+				let dlopen_result = unsafe { dlopen(path_cstring.as_ptr(), RTLD_NOW) };
+
+				if dlopen_result.is_null() {
+					let dlopen_error = unsafe { dlerror() };
+					let dlopen_error = if dlopen_error.is_null() { std::borrow::Cow::from("未知错误") } else { unsafe { std::ffi::CStr::from_ptr(dlopen_error) }.to_string_lossy() };
+					println!("\t翻译失败: {} | {dlopen_error}", path.to_string_lossy());
+					prewarm_failed = true;
+				} else {
+					println!("\t已翻译: {}", path.to_string_lossy());
+				}
+			},
+			Err(error) => {
+				println!("\t翻译失败: {} | {error}", path.to_string_lossy());
+				prewarm_failed = true;
+			}
+		}
+	}
+
+	std::process::exit(if prewarm_failed { 1 } else { 0 });
+}
+
 fn delete_pid_lockfile() {
 	let os_cache_dir = if let Some(dirs_cache_dir) = dirs::cache_dir() { dirs_cache_dir } else { std::env::temp_dir() };
 	let pid_path = extend_pathbuf_and_return(os_cache_dir.clone(), &["gmodpatchtool.pid"]);
 	let running_instance_pid = std::fs::read_to_string(&pid_path);
 
-	if let Ok(pid) = running_instance_pid {
-		if let Ok(pid) = pid.parse::<u32>() {
-			if pid == std::process::id() {
+	if let Ok(pid) = running_instance_pid
+		&& let Ok(pid) = pid.parse::<u32>()
+			&& pid == std::process::id() {
 				let pid_remove_result = std::fs::remove_file(&pid_path);
 				if let Err(error) = pid_remove_result {
 					println!("移除 gmodpatchtool.pid 时失败: {error}");
 				}
 			}
-		}
-	}
 }
 
 fn terminal_exit_handler() {
@@ -1650,20 +1945,24 @@ fn main_script<W>(writer: fn() -> W, writer_is_interactive: bool, args: Args) ->
 where
 	W: std::io::Write + 'static
 {
-	if args.skip_exit_prompt && !writer_is_interactive {
-		return Err(AlmightyError::Generic("在不使用 --skip-exit-prompt 时需要交互式 tty".into()));
-	}
-
-	tokio::runtime::Builder::new_multi_thread()
-		.enable_all()
-		// HACK: Default is typically 2 MiB, but Vdf parsing can sometimes overflow the stack...
-		// TODO: Report localconfig.vdf/config.vdf overflow: https://github.com/CosmicHorrorDev/vdf-rs/issues
-		.thread_stack_size(0x800000) // 8 MiB
-		.build()
-		.map_err(|error| AlmightyError::Generic(format!("创建 Tokio 运行时失败: {error}")))?
-		.block_on(
-			main_script_internal(writer, writer_is_interactive, args)
-		)
+	// Run the script on a thread with a bigger stack, since VDF parsing can overflow the default (only 1 MiB on Windows)
+	// block_on polls the future on the calling thread, so the runtime's thread_stack_size only covers its worker threads
+	// TODO: Report localconfig.vdf/config.vdf overflow: https://github.com/CosmicHorrorDev/vdf-rs/issues
+	std::thread::Builder::new()
+		.stack_size(0x800000) // 8 MiB
+		.spawn(move || {
+			tokio::runtime::Builder::new_multi_thread()
+				.enable_all()
+				.thread_stack_size(0x800000) // 8 MiB
+				.build()
+				.map_err(|error| AlmightyError::Generic(format!("创建 Tokio 运行时失败: {error}")))?
+				.block_on(
+					main_script_internal(writer, writer_is_interactive, args)
+				)
+		})
+		.map_err(|error| AlmightyError::Generic(format!("创建修补线程失败: {error}")))?
+		.join()
+		.map_err(|_| AlmightyError::Generic("修补线程发生崩溃".to_string()))?
 }
 
 fn init_logger<W>(ansi: bool, writer: fn() -> W)
@@ -1680,6 +1979,10 @@ where
 }
 
 pub fn main() {
+	// Exits the process if this is a prewarm child
+	#[cfg(target_os = "macos")]
+	rosetta_prewarm_child();
+
 	#[cfg(target_os = "windows")]
 	use crossterm::ansi_support::supports_ansi;
 	#[cfg(not(target_os = "windows"))]
@@ -1758,7 +2061,8 @@ pub fn main() {
 
 	let skip_exit_prompt = args.skip_exit_prompt;
 
-	if let Err(error) = main_script(writer, writer_is_interactive, args) {
+	let script_result = main_script(writer, writer_is_interactive, args);
+	if let Err(error) = &script_result {
 		error!("{error}");
 	}
 
@@ -1767,4 +2071,12 @@ pub fn main() {
 	} else {
 		delete_pid_lockfile();
 	}
+
+	// Exit non-zero on failure
+	if script_result.is_err() {
+		std::process::exit(1);
+	}
 }
+
+#[cfg(test)]
+mod tests;

@@ -1230,8 +1230,27 @@ where
 				terminal_write(writer, "\x1B[0K\n", false, None);
 			}
 		} else {
-			let elevated_msg = format!("你当前正以管理员身份运行 GModPatchTool{}，这是没有必要的，而且会导致一些不该出现的问题！\n\n如确认操作无误，可以添加启动参数 --run-as-root-with-security-risk 继续运行；程序即将退出...", if cfg!(windows) { "\n（如果你确定没有使用管理员权限运行，那么 UAC 账户控制可能已被关闭！）" } else { "" });
-			return Err(AlmightyError::Generic(elevated_msg));
+			terminal_write(writer, "⚠️警告: 你当前正以管理员身份运行 GModPatchTool！这是没有必要的，而且会导致一些不该出现的问题！", true, if writer_is_interactive { Some("red") } else { None });
+
+			if cfg!(windows) {
+				terminal_write(writer, "（如果你确定没有使用管理员权限运行，那么 UAC 账户控制可能已被关闭！）", true, None);
+			}
+
+			terminal_write(writer, "是否仍要继续修补？输入 y 或直接按回车继续；输入 n 退出。", true, if writer_is_interactive { Some("yellow") } else { None });
+			writer().flush().unwrap();
+
+			let mut answer = String::new();
+			// 无可交互输入（脚本管道等）时默认继续，避免无法应答被卡死
+			let confirmed = match std::io::stdin().read_line(&mut answer) {
+				Ok(0) | Err(_) => true,
+				Ok(_) => !matches!(answer.trim().to_lowercase().as_str(), "n" | "no" | "否" | "不")
+			};
+
+			if !confirmed {
+				return Err(AlmightyError::Generic("已按你的选择退出程序。下次运行如需跳过此询问，可添加启动参数 --run-as-root-with-security-risk。".to_string()));
+			}
+
+			terminal_write(writer, "", true, None);
 		}
 	}
 

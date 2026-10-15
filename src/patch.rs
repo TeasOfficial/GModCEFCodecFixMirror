@@ -404,6 +404,11 @@ struct SteamUserLocalConfigApp {
 	//playtime2wks: u16
 }
 
+// Colors just the label, not the rest of its line
+fn color_label(label: &str, color: &str, writer_is_interactive: bool) -> String {
+	if writer_is_interactive { format!("{}{label}\x1B[0m", COLOR_LOOKUP[color]) } else { label.to_owned() }
+}
+
 fn terminal_write<W>(writer: fn() -> W, output: &str, newline: bool, color: Option<&str>)
 where
 	W: std::io::Write + 'static
@@ -888,7 +893,7 @@ where
 
 		if let Ok(file_hash) = file_hash_result
 			&& file_hash == target_hash {
-				terminal_write(writer, format!("\t已从缓存加载: {filename}").as_str(), true, Some("green"));
+				terminal_write(writer, format!("\t{}: {filename}", color_label("已从缓存加载", "green", writer_is_interactive)).as_str(), true, None);
 				return Ok(());
 			}
 	}
@@ -935,7 +940,7 @@ where
 			Ok(file_hash) => {
 				if file_hash == target_hash {
 					let size_mib = response_bytes.len() as f64 / 0x100000 as f64;
-					terminal_write(writer, format!("\t已下载 [{size_mib:.2} MiB]: {filename}").as_str(), true, Some("green"));
+					terminal_write(writer, format!("\t{} [{size_mib:.2} MiB]: {filename}", color_label("已下载", "green", writer_is_interactive)).as_str(), true, None);
 					return Ok(());
 				} else {
 					terminal_write(writer, format!("\t下载失败: {filename} | 步骤 4: 校验未通过，可能是文件损坏").as_str(), true, if writer_is_interactive { Some("red") } else { None });
@@ -983,7 +988,7 @@ where
 				return new_integrity_status;
 			}
 
-		terminal_write(writer, format!("\t修补完成: {filename}").as_str(), true, Some("green"));
+		terminal_write(writer, format!("\t{}: {filename}", color_label("已修补", "green", writer_is_interactive)).as_str(), true, None);
 		new_integrity_status = IntegrityStatus::Fixed;
 		integrity_status_string = integrity_status_strings[&new_integrity_status];
 	}
@@ -1118,7 +1123,7 @@ where
 			return new_integrity_status;
 		}
 
-		terminal_write(writer, format!("\t已修补: {filename}").as_str(), true, Some("green"));
+		terminal_write(writer, format!("\t{}: {filename}", color_label("已修补", "green", writer_is_interactive)).as_str(), true, None);
 		new_integrity_status = IntegrityStatus::Fixed;
 	}
 
@@ -1785,7 +1790,7 @@ where
 	.map(|(filename, hashes)| {
 		let integrity_result;
 		if args.no_sourcescheme && filename.ends_with(".res") {
-			terminal_write(writer, format!("\t{filename}: 因 --no-sourcescheme 而被跳过").as_str(), true, if writer_is_interactive { Some("green") } else { None });
+			terminal_write(writer, format!("\t{filename}: {}", color_label("因 --no-sourcescheme 跳过", "yellow", writer_is_interactive)).as_str(), true, None);
 			integrity_result = Ok(IntegrityStatus::Fixed);
 		} else {
 			integrity_result = determine_file_integrity_status(gmod_path.clone(), filename, hashes);
@@ -1794,10 +1799,11 @@ where
 			match integrity_result_clone {
 				Ok(integrity_result_clone) => {
 					let integrity_status_string = integrity_status_strings[&integrity_result_clone];
-					terminal_write(writer, format!("\t{filename}: {integrity_status_string}").as_str(), true, if integrity_result_clone == IntegrityStatus::Fixed { Some("green") } else { None });
+					let integrity_status_color = if integrity_result_clone == IntegrityStatus::Fixed { "green" } else { "yellow" };
+					terminal_write(writer, format!("\t{filename}: {}", color_label(integrity_status_string, integrity_status_color, writer_is_interactive)).as_str(), true, None);
 				},
 				Err(error) => {
-					terminal_write(writer, format!("\t{filename}: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+					terminal_write(writer, format!("\t{filename}: {}", color_label(&error, "red", writer_is_interactive)).as_str(), true, None);
 				}
 			}
 		}

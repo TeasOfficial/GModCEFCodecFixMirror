@@ -409,6 +409,24 @@ fn color_label(label: &str, color: &str, writer_is_interactive: bool) -> String 
 	if writer_is_interactive { format!("{}{label}\x1B[0m", COLOR_LOOKUP[color]) } else { label.to_owned() }
 }
 
+// Yellow while there's another server or try left, red once there isn't
+fn retry_label(servers: &[&str], server_id: u8, writer_is_interactive: bool) -> String {
+	if (server_id as usize) < servers.len() { color_label("重试中", "yellow", writer_is_interactive) } else { color_label("下载失败", "red", writer_is_interactive) }
+}
+
+// reqwest only says "error sending request", the actual cause is further down the chain
+fn error_chain(error: &dyn std::error::Error) -> String {
+	let mut message = error.to_string();
+	let mut source = error.source();
+
+	while let Some(cause) = source {
+		message.push_str(&format!(": {cause}"));
+		source = cause.source();
+	}
+
+	message
+}
+
 fn terminal_write<W>(writer: fn() -> W, output: &str, newline: bool, color: Option<&str>)
 where
 	W: std::io::Write + 'static
@@ -658,15 +676,14 @@ where
 					response = Some(response_unwrapped);
 					break;
 				} else {
-					terminal_write(writer, format!("\n{url}\n\t错误的 HTTP 状态码: {response_status_code}\n\n正在尝试切换下载源...").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 					response = None;
 					server_id += 1;
 					try_count = 0;
+					terminal_write(writer, format!("\t{}: {filename} | 错误的 HTTP 状态码: {response_status_code}", retry_label(servers, server_id, writer_is_interactive)).as_str(), true, None);
 				}
 			},
 			Err(error) => {
 				let error = error.without_url();
-				terminal_write(writer, format!("\n{url}\n\tHTTP 出错: {error}\n\n当前重试次数：{try_count}。\n无需担心，连续失败三次后会自动切换备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 				response = None;
 				try_count += 1;
 
@@ -675,6 +692,8 @@ where
 					server_id += 1;
 					try_count = 0;
 				}
+
+				terminal_write(writer, format!("\t{}: {filename} | HTTP 出错: {}", retry_label(servers, server_id, writer_is_interactive), error_chain(&error)).as_str(), true, None);
 			}
 		}
 	}
@@ -730,7 +749,6 @@ where
 					break;
 				},
 				Some(error) => {
-					terminal_write(writer, format!("\nHTTP 字节错误: {error}\n\n当前重试次数：{try_count}。\n无需担心，连续失败三次后会自动切换备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 					response_bytes = None;
 					try_count += 1;
 
@@ -739,6 +757,8 @@ where
 						server_id += 1;
 						try_count = 0;
 					}
+
+					terminal_write(writer, format!("\t{}: {filename} | HTTP 字节错误: {}", retry_label(servers, server_id, writer_is_interactive), error_chain(&error)).as_str(), true, None);
 				}
 			}
 		} else {
@@ -771,7 +791,6 @@ where
 					break;
 				},
 				Err(error) => {
-					terminal_write(writer, format!("\nHTTP 文本错误: {error}\n\n当前重试次数：{try_count}。\n无需担心，连续失败三次后会自动切换备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 					response_text = None;
 					try_count += 1;
 
@@ -780,6 +799,8 @@ where
 						server_id += 1;
 						try_count = 0;
 					}
+
+					terminal_write(writer, format!("\t{}: {filename} | HTTP 文本错误: {}", retry_label(servers, server_id, writer_is_interactive), error_chain(&error)).as_str(), true, None);
 				}
 			}
 		} else {
@@ -813,7 +834,6 @@ where
 					break;
 				},
 				Err(error) => {
-					terminal_write(writer, format!("\nHTTP JSON 错误: {error}\n\n当前重试次数：{try_count}。\n无需担心，连续失败三次后会自动切换备用源！").as_str(), true, if writer_is_interactive { Some("red") } else { None });
 					response_json = None;
 					try_count += 1;
 
@@ -822,6 +842,8 @@ where
 						server_id += 1;
 						try_count = 0;
 					}
+
+					terminal_write(writer, format!("\t{}: {filename} | HTTP JSON 错误: {}", retry_label(servers, server_id, writer_is_interactive), error_chain(&error)).as_str(), true, None);
 				}
 			}
 		} else {
@@ -910,7 +932,7 @@ where
 			let create_dir_result = tokio::fs::create_dir_all(cache_file_path_dir).await;
 
 			if let Err(error) = create_dir_result {
-				terminal_write(writer, format!("\t下载时失败: {filename} | 步骤 1: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t{}: {filename} | 步骤 1: {error}", color_label("下载失败", "red", writer_is_interactive)).as_str(), true, None);
 				return Err(());
 			}
 		}
@@ -922,7 +944,7 @@ where
 
 			let decompress_result = zstd::stream::copy_decode(&response_bytes[..], &mut bytes);
 			if let Err(error) = decompress_result {
-				terminal_write(writer, format!("\t解压失败: {filename} | {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t{}: {filename} | {error}", color_label("解压失败", "red", writer_is_interactive)).as_str(), true, None);
 				return Err(());
 			}
 
@@ -931,7 +953,7 @@ where
 
 		let write_result = tokio::fs::write(cache_file_path.clone(), bytes).await;
 		if let Err(error) = write_result {
-			terminal_write(writer, format!("\t下载失败: {filename} | 步骤 2: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+			terminal_write(writer, format!("\t{}: {filename} | 步骤 2: {error}", color_label("下载失败", "red", writer_is_interactive)).as_str(), true, None);
 			return Err(());
 		}
 
@@ -943,11 +965,11 @@ where
 					terminal_write(writer, format!("\t{} [{size_mib:.2} MiB]: {filename}", color_label("已下载", "green", writer_is_interactive)).as_str(), true, None);
 					return Ok(());
 				} else {
-					terminal_write(writer, format!("\t下载失败: {filename} | 步骤 4: 校验未通过，可能是文件损坏").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+					terminal_write(writer, format!("\t{}: {filename} | 步骤 4: 校验未通过，可能是文件损坏", color_label("下载失败", "red", writer_is_interactive)).as_str(), true, None);
 				}
 			},
 			Err(error) => {
-				terminal_write(writer, format!("\t下载失败: {filename} | 步骤 3: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t{}: {filename} | 步骤 3: {error}", color_label("下载失败", "red", writer_is_interactive)).as_str(), true, None);
 			}
 		}
 	}
@@ -984,7 +1006,7 @@ where
 	if new_integrity_status == IntegrityStatus::NeedDelete {
 		if let Err(delete_error) = std::fs::remove_file(&gmod_file_path)
 			&& let Err(truncate_error) = File::create(&gmod_file_path) {
-				terminal_write(writer, format!("\t修补时出现问题: {filename} | {integrity_status_string}:\n\t删除: {delete_error}\n\t截断: {truncate_error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string}:\n\t删除: {delete_error}\n\t截断: {truncate_error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 				return new_integrity_status;
 			}
 
@@ -1002,7 +1024,7 @@ where
 			let create_dir_result = std::fs::create_dir_all(gmod_file_path_dir);
 
 			if let Err(error) = create_dir_result {
-				terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string}: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string}: {error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 				return new_integrity_status;
 			}
 		}
@@ -1016,7 +1038,7 @@ where
 				let copy_result = std::fs::copy(original_cache_file_path, &gmod_file_path);
 
 				if let Err(error) = copy_result {
-					terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string}: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+					terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string}: {error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 					return new_integrity_status;
 				}
 
@@ -1024,7 +1046,7 @@ where
 				integrity_status_string = integrity_status_strings[&new_integrity_status];
 			},
 			Err(error) => {
-				terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string}: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string}: {error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 				return new_integrity_status;
 			}
 		}
@@ -1039,7 +1061,7 @@ where
 			let create_dir_result = std::fs::create_dir_all(gmod_file_path_dir);
 
 			if let Err(error) = create_dir_result {
-				terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string}: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string}: {error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 				return new_integrity_status;
 			}
 		}
@@ -1047,7 +1069,7 @@ where
 		let create_result = File::create(&gmod_file_path);
 
 		if let Err(error) = create_result {
-			terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string}: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+			terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string}: {error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 			return new_integrity_status;
 		}
 
@@ -1060,7 +1082,7 @@ where
 		let gmod_file_path = match path_to_canonical_pathbuf(gmod_file_path, false) {
 			Ok(gmod_file_path) => gmod_file_path,
 			Err(error) => {
-				terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 1: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string} / 步骤 1: {error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 				return new_integrity_status;
 			}
 		};
@@ -1071,7 +1093,7 @@ where
 		let patch_file_path = match path_to_canonical_pathbuf(extend_pathbuf_and_return(cache_dir.to_path_buf(), &patch_file_parts[..]), false) {
 			Ok(patch_file_path) => patch_file_path,
 			Err(error) => {
-				terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 2: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string} / 步骤 2: {error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 				return new_integrity_status;
 			}
 		};
@@ -1079,7 +1101,7 @@ where
 		let gmod_file = match std::fs::read(gmod_file_path.clone()) {
 			Ok(gmod_file) => gmod_file,
 			Err(error) => {
-				terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 3: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string} / 步骤 3: {error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 				return new_integrity_status;
 			}
 		};
@@ -1087,7 +1109,7 @@ where
 		let patch_file = match std::fs::read(patch_file_path) {
 			Ok(patch_file) => patch_file,
 			Err(error) => {
-				terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 4: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string} / 步骤 4: {error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 				return new_integrity_status;
 			}
 		};
@@ -1095,7 +1117,7 @@ where
 		let patcher = match Bspatch::new(&patch_file) {
 			Ok(patcher) => patcher,
 			Err(error) => {
-				terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 5: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+				terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string} / 步骤 5: {error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 				return new_integrity_status;
 			}
 		};
@@ -1104,7 +1126,7 @@ where
 		let patch_result = patcher.apply(&gmod_file, io::Cursor::new(&mut new_gmod_file));
 
 		if let Err(error) = patch_result {
-			terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 6: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+			terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string} / 步骤 6: {error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 			return new_integrity_status;
 		}
 
@@ -1112,14 +1134,14 @@ where
 		let file_hash = format!("{}", blake3::hash(&new_gmod_file));
 
 		if file_hash != hashes["fixed"] {
-			terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 7: 文件校验失败，可能是文件已损坏").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+			terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string} / 步骤 7: 文件校验失败，可能是文件已损坏", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 			return new_integrity_status;
 		}
 
 		let write_result = std::fs::write(&gmod_file_path, &new_gmod_file);
 
 		if let Err(error) = write_result {
-			terminal_write(writer, format!("\t修补时出错: {filename} | {integrity_status_string} / 步骤 8: {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+			terminal_write(writer, format!("\t{}: {filename} | {integrity_status_string} / 步骤 8: {error}", color_label("修补失败", "red", writer_is_interactive)).as_str(), true, None);
 			return new_integrity_status;
 		}
 
@@ -2020,7 +2042,7 @@ where
 										terminal_write(writer, format!("\t{filename}").as_str(), true, None);
 									},
 									Err(error) => {
-										terminal_write(writer, format!("\t应用权限失败：{filename} | {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+										terminal_write(writer, format!("\t{}: {filename} | {error}", color_label("应用权限失败", "red", writer_is_interactive)).as_str(), true, None);
 
 										// Re-applying perms can fail on already-fine files we don't own; only a missing bit is fatal
 										if !already_executable {
@@ -2030,7 +2052,7 @@ where
 								}
 							},
 							Err(error) => {
-								terminal_write(writer, format!("\t应用权限失败：{filename} | {error}").as_str(), true, if writer_is_interactive { Some("red") } else { None });
+								terminal_write(writer, format!("\t{}: {filename} | {error}", color_label("应用权限失败", "red", writer_is_interactive)).as_str(), true, None);
 							}
 						}
 					}

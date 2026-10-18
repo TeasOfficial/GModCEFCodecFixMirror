@@ -1,44 +1,171 @@
-name: Cross Platform Build
+name: Build & Release
 
+# 每次推送到 main 都构建三平台产物并发布一个 Release。
+# PR 只构建、不发布；workflow_dispatch 可手动重跑（同一提交会更新同一个 Release）。
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+
+# 默认只读；只有 release job 申请 contents: write
+permissions:
+  contents: read
+
+# 同一提交只保留一份运行；不同提交并行，保证每个 commit 都有机会出包
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-
-          - os: windows-latest
+          - name: windows-x86_64
+            os: windows-latest
             target: x86_64-pc-windows-msvc
-
-          - os: macos-latest
+            binary: gmodpatchtool.exe
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: gmodpatchtool
+          - name: macos-x86_64
+            os: macos-latest
             target: x86_64-apple-darwin
-
-    runs-on: ${{ matrix.os }}
+            binary: gmodpatchtool
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
-          lfs: true
+          lfs: true # build.rs 需要真实的 PNG，而不是 LFS 指针
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
         with:
-          name: GModPatchToolMirror-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/gmodpatchtool*
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # 未公证的 macOS 二进制给一个 ad-hoc 签名，减少“已损坏”提示
+      - name: Ad-hoc sign (macOS)
+        if: runner.os == 'macOS'
+        continue-on-error: true # 签名失败不应阻断出包
+        run: codesign --force --sign - "target/${{ matrix.target }}/release/${{ matrix.binary }}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+          overwrite: true # 手动重跑时覆盖同名 artifact
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read # 读取同一 run 的构建产物
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(tr -d '\r\n' < version.txt)"
+          short="${GITHUB_SHA::7}"
+          tag="${version}-${short}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          mkdir -p dist
+
+          package() {
+            local src="$1" out="$2" bin="$3"
+            local dir="staging/${out}"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            cp "$src" "${dir}/${bin}"
+            cp README.md LICENSE.txt version.txt "$dir/"
+            chmod +x "${dir}/${bin}" 2>/dev/null || true
+            (cd "$dir" && zip -X -q -r "../../dist/${out}.zip" .)
+          }
+
+          package artifacts/windows-x86_64/gmodpatchtool.exe GModPatchTool-Mirror-Windows-x86_64 gmodpatchtool.exe
+          package artifacts/linux-x86_64/gmodpatchtool       GModPatchTool-Mirror-Linux-x86_64   gmodpatchtool
+          package artifacts/macos-x86_64/gmodpatchtool       GModPatchTool-Mirror-macOS-x86_64   gmodpatchtool
+
+          (cd dist && sha256sum *.zip > SHA256SUMS.txt)
+
+          {
+            echo "## 镜像版自动构建"
+            echo
+            echo "- 版本号：\`${version}\`"
+            echo "- 提交： [\`${short}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})"
+            echo "- 触发方式：\`${GITHUB_EVENT_NAME}\`"
+            echo
+            echo "> 这是每次提交自动打包的构建，用于测试与提前体验，不等同于上游正式版。"
+            echo
+            echo "### 下载说明"
+            echo
+            echo "| 平台 | 文件 | 说明 |"
+            echo "| --- | --- | --- |"
+            echo "| Windows x86_64 | \`GModPatchTool-Mirror-Windows-x86_64.zip\` | 解压后运行 \`gmodpatchtool.exe\` |"
+            echo "| Linux x86_64 | \`GModPatchTool-Mirror-Linux-x86_64.zip\` | 在 Ubuntu 22.04 上构建，需要 glibc 2.35+ |"
+            echo "| macOS x86_64 | \`GModPatchTool-Mirror-macOS-x86_64.zip\` | 仅 x86_64（Apple Silicon 走 Rosetta 2）；未公证，首次运行可能需在“隐私与安全性”中放行 |"
+            echo
+            echo "### 运行提示"
+            echo
+            echo "- Windows：可能提示“未知发布者”，选择“更多信息 → 仍要运行”。"
+            echo "- Linux：解压后如无执行权限，运行 \`chmod +x gmodpatchtool\`。"
+            echo "- macOS：未公证，首次运行需在“系统设置 → 隐私与安全性”中放行；如无执行权限同样 \`chmod +x gmodpatchtool\`。"
+            echo
+            echo "### 校验和"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } > dist/release-notes.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.package.outputs.tag }}
+          body_path: dist/release-notes.md
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          prerelease: false
+          make_latest: true

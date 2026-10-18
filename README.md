@@ -6,6 +6,8 @@
 
 **由 Solstice Game Studios 制作 (solsticegamestudios.com)**
 
+> 本镜像当前基于上游 GModPatchTool **20260722**（`c4044ae`）版本制作。
+
 # 🛠️ 补丁内容
 ### 1. 对于所有平台
 - 修复了 Linux/macOS 上潜在的启动问题，如：主菜单丢失、启动失败等
@@ -13,13 +15,19 @@
   - 为所有的 CEF 页面设置最大帧率上限！
   - 通过降低页面帧率，可能会提高游戏帧率
   - 默认为 60
+- 新增参数 `-chromium_remote_debugging_port`
+  - 可选：在指定端口启动 CEF 的远程调试服务器（Chrome DevTools），方便检查游戏内的 HTML 面板
+  - 默认关闭；填写 1024–65535 之间的端口即可启用，例如 `-chromium_remote_debugging_port 9222`
+- 新增参数 `-chromium_mute_audio`
+  - 可选：静音该游戏实例中所有 CEF 网页面板的音频
+  - 同时开第二个 GMod 实例（`-multirun`）时，可以避免声音重叠
 - 通过我们全新的 SourceScheme.res，重置了传统 VGUI 组件！
 - 将开发者控制台的字体修改为 [PT Mono](https://fonts.google.com/specimen/PT+Mono)，以提高所有平台的一致性/可读性（镜像版日后可能会支持自定义字体）
   - 这对于 Proton 特别重要，因为使用这些字体的文本在默认情况下会显示不正常或非常小（没有 Lucida Console）
-  - 如果你不喜欢字体替换或 VGUI 重置，可以在修补器中添加启动参数 `--no-sourcescheme` 来跳过这一项，我们也会在安装过程中询问你（镜像版独占）
+  - 如果你不喜欢字体替换或 VGUI 重置，可以在启动时添加参数 `--no-sourcescheme` 跳过这一项
 
 ### 2. 游戏内浏览器 ([Chromium 嵌入式框架, 也叫 CEF](https://en.wikipedia.org/wiki/Chromium_Embedded_Framework))
-- 将 CEF 框架内核更新为 137.0.10 版本（Chromium 137.0.7151.69）
+- 将 CEF 框架内核更新为 137.0.19 版本（Chromium 137.0.7151.121）
 - 启用专有音视频编解码器（Proprietary Video/Audio codec），为 H.264 (MP4) 与 AAC 等格式添加支持！
 - 启用了 [Widevine](https://www.widevine.com) 支持（但没有 [VMP](https://github.com/solsticegamestudios/GModPatchTool/issues/100)，Netflix 等服务目前仍无法使用）
 - 启用软件 WebGL
@@ -40,10 +48,29 @@
   - 请参阅 [#188](https://github.com/solsticegamestudios/GModPatchTool/issues/188) 了解我们为什么默认不启用这些功能
 
 # ❓ 如何使用
-推荐：下载 **[最新构建](https://github.com/solsticegamestudios/GModPatchTool/releases)** 并运行应用程序
+推荐：下载 **[镜像版最新构建](https://nekogan.com/gccf)** 并运行应用程序；也可以使用[上游官方构建](https://github.com/solsticegamestudios/GModPatchTool/releases)（未汉化）。
 
 需要更多技术支持？请访问 https://solsticegamestudios.com/fixmedia/
 或加入国内 QQ 群：105969906
+
+# ⚙️ 命令行参数
+正常情况下不需要添加任何参数，直接运行即可；需要更多控制时可以使用：
+
+| 参数 | 作用 |
+| --- | --- |
+| `-l`, `--launch-gmod` | 修补成功后启动 Garry's Mod |
+| `-s`, `--skip-exit-prompt` | 退出时跳过“按回车键退出...”提示 |
+| `--steam-path <路径>` | 强制指定 Steam 安装路径（不是 Steam 库路径） |
+| `--no-sourcescheme` | 不应用 SourceScheme（VGUI 主题）改动 |
+| `--skip-clear-chromiumcache` | 跳过删除 GarrysMod 目录下的 ChromiumCache、ChromiumCacheMultirun 与 chromium.log |
+| `--skip-rosetta-prewarm` | 跳过在 Apple Silicon 上预热已修补库的 Rosetta 翻译（仅 macOS） |
+| `--disable-cache` | 强制重新下载全部补丁文件，并在退出时清空 GModPatchTool 缓存目录 |
+| `--no-system-proxy` | 不使用系统代理配置发起 HTTP 请求；挂代理/VPN 时下载失败可以试试 |
+| `--ignore-gmod-running` | GMod 正在运行时也强制修补（可能导致问题！） |
+
+另有 `--run-as-root-with-security-risk`：跳过“以管理员身份运行”的确认提示（不推荐）。修补失败时程序会以非零退出码结束，方便脚本判断。
+
+> 镜像版说明：启动时会自动检测 gh-proxy 与 scs.mf.nekogan.com 的下载速度并选用较快的源，无需手动指定。
 
 # 👩‍💻 以下内容仅对开发者有效
 ### 如何使用？

@@ -115,7 +115,9 @@ jobs:
             rm -rf "$dir"
             mkdir -p "$dir"
             cp "$src" "${dir}/${bin}"
-            cp README.md LICENSE.txt version.txt "$dir/"
+            cp README.md LICENSE.txt version.txt AI_POLICY.md "$dir/"
+            mkdir -p "${dir}/fonts"
+            cp fonts/JetBrainsMono-OFL.txt "${dir}/fonts/"
             chmod +x "${dir}/${bin}" 2>/dev/null || true
             (cd "$dir" && zip -X -q -r "../../dist/${out}.zip" .)
           }
